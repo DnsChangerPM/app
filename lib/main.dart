@@ -1,16 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'screens/home_screen.dart';
 import 'services/app_config.dart';
-import 'services/version_service.dart';
+import 'widgets/app_update_guard.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await AppConfig.load();
-  // Kick off the update check in the background (non-blocking).
-  VersionService.instance.startBackgroundChecks();
-  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   runApp(const DnsChangerApp());
 }
 
@@ -39,7 +36,7 @@ class DnsChangerApp extends StatelessWidget {
           centerTitle: true,
         ),
       ),
-      home: const HomeScreen(),
+      home: const AppUpdateGuard(),
     );
   }
 }

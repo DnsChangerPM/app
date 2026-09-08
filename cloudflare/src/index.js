@@ -239,6 +239,7 @@ async function getLatestRelease(env, cfg) {
           name: a.name,
           browser_download_url: a.browser_download_url,
           size: a.size,
+          digest: a.digest || null,
         })),
       };
       cfg.last_release = slim;

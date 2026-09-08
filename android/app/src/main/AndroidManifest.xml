@@ -33,6 +33,16 @@
             </intent-filter>
         </activity>
 
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
@@ -41,7 +51,11 @@
             android:name=".DnsVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
@@ -52,6 +66,12 @@
     </application>
 
     <queries>
+        <!-- Make user-selected, launchable target apps visible on Android 11+.
+             No QUERY_ALL_PACKAGES permission is needed. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT" />
             <data android:mimeType="text/plain" />
