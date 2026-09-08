@@ -96,9 +96,16 @@ jobs:
           generate_release_notes: true
 
       - name: Notify Cloudflare admin (disable old versions)
-        if: ${{ secrets.CLOUDFLARE_WORKER_URL != '' && secrets.ADMIN_KEY != '' }}
+        env:
+          WORKER_URL: ${{ secrets.CLOUDFLARE_WORKER_URL }}
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
         run: |
-          curl -sS -X POST "${{ secrets.CLOUDFLARE_WORKER_URL }}/api/admin/config" \
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$WORKER_URL" ] || [ -z "$ADMIN_KEY" ]; then
+            echo "Skipping worker notify: CLOUDFLARE_WORKER_URL / ADMIN_KEY secrets not set."
+            exit 0
+          fi
+          curl -sS -X POST "$WORKER_URL/api/admin/config" \
             -H "Content-Type: application/json" \
-            -H "x-admin-key: ${{ secrets.ADMIN_KEY }}" \
-            -d "{\"min_version\":\"${{ github.event.inputs.version }}\"}"
+            -H "x-admin-key: $ADMIN_KEY" \
+            -d "{\"min_version\":\"$V\"}"
