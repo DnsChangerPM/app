@@ -29,7 +29,19 @@ jobs:
         run: flutter pub get
 
       - name: Analyze
-        run: flutter analyze
+        run: |
+          set +e
+          flutter analyze > analyze.log 2>&1
+          STATUS=$?
+          tail -n 200 analyze.log
+          exit $STATUS
+
+      - name: Upload analyze log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-log
+          path: analyze.log
 
       - name: Test
         run: flutter test
