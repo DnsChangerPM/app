@@ -31,10 +31,10 @@ jobs:
       - name: Analyze
         run: flutter analyze
 
-      - name: Build debug APK
+      - name: Build release APK
         run: |
           set +e
-          flutter build apk --debug > build.log 2>&1
+          flutter build apk --release > build.log 2>&1
           STATUS=$?
           if [ $STATUS -ne 0 ]; then
             {
