@@ -6,6 +6,7 @@ class DnsServer {
   final List<String> addresses; // IPs (optionally "ip:port"), no DoH URLs.
   final String? country;
   final bool isPremium;
+  final bool isCustom;
 
   const DnsServer({
     required this.id,
@@ -14,6 +15,7 @@ class DnsServer {
     required this.addresses,
     this.country,
     this.isPremium = false,
+    this.isCustom = false,
   });
 
   DnsServer copyWith({bool? isPremium}) {
@@ -24,6 +26,7 @@ class DnsServer {
       addresses: addresses,
       country: country,
       isPremium: isPremium ?? this.isPremium,
+      isCustom: isCustom,
     );
   }
 }

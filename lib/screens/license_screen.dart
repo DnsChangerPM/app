@@ -28,6 +28,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
 
   Future<void> _init() async {
     await _service.load();
+    if (!mounted) return;
     setState(() {
       info = _service.cachedInfo;
       _keyController.text = _service.licenseKey ?? '';
@@ -39,7 +40,9 @@ class _LicenseScreenState extends State<LicenseScreen> {
     var id = prefs.getString('device_id');
     if (id == null) {
       final rand = Random.secure();
-      id = List.generate(16, (_) => rand.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+      id = List.generate(
+              16, (_) => rand.nextInt(256).toRadixString(16).padLeft(2, '0'))
+          .join();
       await prefs.setString('device_id', id);
     }
     return id;
@@ -58,8 +61,13 @@ class _LicenseScreenState extends State<LicenseScreen> {
         deviceName: 'Android',
         deviceId: await _deviceId(),
       );
+      if (!mounted) return;
       setState(() => info = result);
-      _snack(result.message ?? (result.isActive ? 'Activated!' : 'Activation failed'));
+      _snack(result.message ??
+          (result.isActive ? 'Activated!' : 'Activation failed'));
+    } catch (_) {
+      // Network exceptions can contain the private API URL; never show them.
+      _snack('ارتباط با سرویس برقرار نشد؛ دوباره تلاش کنید.');
     } finally {
       if (mounted) setState(() => loading = false);
     }
@@ -67,11 +75,18 @@ class _LicenseScreenState extends State<LicenseScreen> {
 
   Future<void> _deactivate() async {
     await _service.clear();
+    if (!mounted) return;
     setState(() {
       info = null;
       _keyController.clear();
     });
     _snack('License removed');
+  }
+
+  @override
+  void dispose() {
+    _keyController.dispose();
+    super.dispose();
   }
 
   void _snack(String msg) {
@@ -91,7 +106,8 @@ class _LicenseScreenState extends State<LicenseScreen> {
             _activeCard(),
             const SizedBox(height: 20),
           ] else ...[
-            const Icon(Icons.workspace_premium, size: 64, color: Color(0xFF00D1B2)),
+            const Icon(Icons.workspace_premium,
+                size: 64, color: Color(0xFF00D1B2)),
             const SizedBox(height: 12),
             const Text(
               'Enter your license key',
@@ -134,8 +150,10 @@ class _LicenseScreenState extends State<LicenseScreen> {
             onPressed: loading ? null : _activate,
             icon: loading
                 ? const SizedBox(
-                    width: 18, height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.black),
                   )
                 : const Icon(Icons.check_circle_outline),
             label: Text(active ? 'Refresh' : 'Activate'),
@@ -145,7 +163,8 @@ class _LicenseScreenState extends State<LicenseScreen> {
             TextButton.icon(
               onPressed: _deactivate,
               icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-              label: const Text('Remove license', style: TextStyle(color: Colors.redAccent)),
+              label: const Text('Remove license',
+                  style: TextStyle(color: Colors.redAccent)),
             ),
           ],
           const SizedBox(height: 24),
@@ -180,14 +199,21 @@ class _LicenseScreenState extends State<LicenseScreen> {
               const SizedBox(width: 8),
               Text(
                 i.planName ?? 'Subscription',
-                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00D1B2)),
+                style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF00D1B2)),
               ),
             ],
           ),
           const SizedBox(height: 12),
           _row('Status', i.status.toUpperCase()),
           _row('Devices', '${i.deviceCount ?? 0} / ${i.deviceLimit ?? '∞'}'),
-          _row('Expires', i.expiresAt == null ? 'Lifetime' : '${i.expiresAt!.toLocal()}'.substring(0, 16)),
+          _row(
+              'Expires',
+              i.expiresAt == null
+                  ? 'Lifetime'
+                  : '${i.expiresAt!.toLocal()}'.substring(0, 16)),
           _row('Days left', daysLeft),
         ],
       ),
