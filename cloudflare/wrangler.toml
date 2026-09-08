@@ -1,0 +1,30 @@
+# Cloudflare Worker configuration for the DNS Changer admin panel.
+#
+# BEFORE DEPLOYING:
+#   1. Create three KV namespaces and paste their IDs below:
+#        wrangler kv namespace create LICENSES
+#        wrangler kv namespace create DEVICES
+#        wrangler kv namespace create CONFIG
+#   2. (Recommended) set an admin key secret:
+#        wrangler secret put ADMIN_KEY
+#   3. Deploy:
+#        npx wrangler deploy
+
+name = "dns-changer-admin"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# NOTE: This file is git-ignored (see cloudflare/.gitignore via root .gitignore).
+# Copy this template and fill in the IDs below.
+
+[[kv_namespaces]]
+binding = "LICENSES_KV"
+id = "REPLACE_WITH_LICENSES_KV_ID"
+
+[[kv_namespaces]]
+binding = "DEVICES_KV"
+id = "REPLACE_WITH_DEVICES_KV_ID"
+
+[[kv_namespaces]]
+binding = "CONFIG_KV"
+id = "REPLACE_WITH_CONFIG_KV_ID"

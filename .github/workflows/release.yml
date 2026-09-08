@@ -1,0 +1,125 @@
+name: Build and Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'App version (e.g. 1.2.0) — this becomes the release tag "vX.Y.Z"'
+        required: true
+        type: string
+      notes:
+        description: 'Release notes (optional)'
+        required: false
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Determine version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+          fi
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Version must be in X.Y.Z format (got: $V)"; exit 1; }
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Apply version
+        run: |
+          V="$VERSION"
+          MAJOR=$(echo "$V" | cut -d. -f1)
+          MINOR=$(echo "$V" | cut -d. -f2)
+          PATCH=$(echo "$V" | cut -d. -f3)
+          CODE=$((MAJOR*10000 + MINOR*100 + PATCH))
+          sed -i -E "s/^version: .*/version: $V+$CODE/" pubspec.yaml
+          echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
+
+      - name: Configure signing (if secrets are set)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::No KEYSTORE_BASE64 secret set — APK will be signed with the debug key."
+            echo "::warning::Users will NOT be able to update between releases. Run scripts/gen_keystore.sh and add the secrets."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/key.jks
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=key.jks
+          EOF
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: |
+          if [ -n "$API_BASE_URL" ]; then
+            echo "Baking in API base URL: $API_BASE_URL"
+            flutter build apk --release --dart-define=API_BASE_URL="$API_BASE_URL"
+          else
+            echo "No API_BASE_URL secret — using the app default (change it in Settings)."
+            flutter build apk --release
+          fi
+
+      - name: Rename APK
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk "DNS-Changer-v$VERSION.apk"
+          ls -la *.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.VERSION }}"
+          name: "DNS Changer v${{ env.VERSION }}"
+          body: "${{ github.event.inputs.notes }}"
+          files: "DNS-Changer-v${{ env.VERSION }}.apk"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      - name: Notify Cloudflare admin (disable old versions)
+        env:
+          WORKER_URL: ${{ secrets.CLOUDFLARE_WORKER_URL }}
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
+        run: |
+          if [ -z "$WORKER_URL" ] || [ -z "$ADMIN_KEY" ]; then
+            echo "Skipping worker notify: CLOUDFLARE_WORKER_URL / ADMIN_KEY secrets not set."
+            exit 0
+          fi
+          curl -sS -X POST "$WORKER_URL/api/admin/config" \
+            -H "Content-Type: application/json" \
+            -H "x-admin-key: $ADMIN_KEY" \
+            -d "{\"min_version\":\"$VERSION\"}"
