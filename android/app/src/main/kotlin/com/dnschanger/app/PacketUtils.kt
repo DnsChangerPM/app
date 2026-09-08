@@ -162,7 +162,7 @@ object PacketUtils {
         tcp.putInt(ack)
         tcp.put((0x50).toByte()) // data offset 5 (20 bytes)
         tcp.put(flags.toByte())
-        tcp.putShort(65535) // window
+        tcp.putShort(0xFFFF.toShort()) // window
         tcp.putShort(0) // checksum placeholder
         tcp.putShort(0) // urgent pointer
         tcp.put(payload)
