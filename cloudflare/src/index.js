@@ -43,6 +43,12 @@ function normKey(k) {
   return String(k || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
+// Human-readable form (XXXX-XXXX-XXXX-XXXX) used for display and for legacy KV keys.
+function keyWithDashes(k) {
+  const norm = normKey(k);
+  return norm.length === 16 ? norm.replace(/(.{4})(?=.)/g, '$1-') : norm;
+}
+
 function b64(str) {
   try { return btoa(String(str)); } catch (_) { return ''; }
 }
@@ -90,27 +96,106 @@ function authorized(cfg, request, url, env) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// License / device storage helpers.
+//
+// CRITICAL: all keys are stored under the CANONICAL normalized form
+// (`license:ABCDEFGHIJKLMNOP`, `device:ABCDEFGHIJKLMNOP:<id>`). Older workers
+// stored them under the dashed form (`license:ABCD-EFGH-IJKL-MNOP`), which
+// could never be found by the client (it normalizes the typed key), causing
+// "not found" — and in the old app, a misleading "Server error (404)" even
+// with the correct license key. Get/put/list therefore handle both forms and
+// transparently migrate legacy records.
+// ---------------------------------------------------------------------------
+
 async function getLicense(env, key) {
-  const raw = await env.LICENSES_KV.get('license:' + key);
-  return raw ? JSON.parse(raw) : null;
+  const norm = normKey(key);
+  const raw = await env.LICENSES_KV.get('license:' + norm);
+  if (raw) return JSON.parse(raw);
+
+  // Legacy: earlier versions stored the key with dashes.
+  const legacyKey = keyWithDashes(norm);
+  if (legacyKey !== norm) {
+    const legacyRaw = await env.LICENSES_KV.get('license:' + legacyKey);
+    if (legacyRaw) {
+      const lic = JSON.parse(legacyRaw);
+      lic.key = norm;
+      await env.LICENSES_KV.put('license:' + norm, JSON.stringify(lic));
+      await env.LICENSES_KV.delete('license:' + legacyKey);
+      return lic;
+    }
+  }
+  return null;
 }
 
 async function putLicense(env, lic) {
+  lic.key = normKey(lic.key);
   await env.LICENSES_KV.put('license:' + lic.key, JSON.stringify(lic));
   return lic;
 }
 
 async function listDevices(env, key) {
-  const list = await env.DEVICES_KV.list({ prefix: 'device:' + key + ':' });
+  const norm = normKey(key);
+  const legacyPrefix = 'device:' + keyWithDashes(norm) + ':';
+  const names = await collectDeviceKeys(env, norm, legacyPrefix);
   const out = [];
-  for (const k of list.keys) {
-    const raw = await env.DEVICES_KV.get(k.name);
+  for (const name of names) {
+    const raw = await env.DEVICES_KV.get(name);
     if (raw) {
       try { out.push(JSON.parse(raw)); } catch (_) {}
     }
   }
   out.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0));
   return out;
+}
+
+// Returns canonical `device:<NORM>:<id>` names, migrating legacy dashed keys
+// (e.g. `device:ABCD-EFGH-IJKL-MNOP:<id>`) to the canonical form on the fly.
+async function collectDeviceKeys(env, norm, legacyPrefix) {
+  const normPrefix = 'device:' + norm + ':';
+  const lists = await Promise.all([
+    env.DEVICES_KV.list({ prefix: normPrefix }),
+    legacyPrefix && legacyPrefix !== normPrefix
+      ? env.DEVICES_KV.list({ prefix: legacyPrefix })
+      : Promise.resolve({ keys: [] }),
+  ]);
+  const seen = new Set();
+  const names = [];
+  for (const item of lists[0].keys) {
+    seen.add(item.name);
+    names.push(item.name);
+  }
+  for (const item of lists[1].keys) {
+    const id = item.name.slice(legacyPrefix.length);
+    const canonical = normPrefix + id;
+    if (seen.has(canonical)) {
+      // A canonical record already exists; drop the stale legacy copy.
+      await env.DEVICES_KV.delete(item.name);
+      continue;
+    }
+    const raw = await env.DEVICES_KV.get(item.name);
+    if (raw) {
+      await env.DEVICES_KV.put(canonical, raw);
+      await env.DEVICES_KV.delete(item.name);
+    }
+    seen.add(canonical);
+    names.push(canonical);
+  }
+  return names;
+}
+
+async function deleteDevice(env, key, deviceId) {
+  const norm = normKey(key);
+  await env.DEVICES_KV.delete('device:' + norm + ':' + deviceId);
+  await env.DEVICES_KV.delete('device:' + keyWithDashes(norm) + ':' + deviceId);
+}
+
+async function deleteLicenseData(env, key) {
+  const norm = normKey(key);
+  await env.LICENSES_KV.delete('license:' + norm);
+  await env.LICENSES_KV.delete('license:' + keyWithDashes(norm));
+  const names = await collectDeviceKeys(env, norm, 'device:' + keyWithDashes(norm) + ':');
+  for (const name of names) await env.DEVICES_KV.delete(name);
 }
 
 function isExpired(lic) {
@@ -126,7 +211,7 @@ function licenseStatus(lic) {
 
 function pubLicense(lic) {
   return {
-    key: lic.key,
+    key: keyWithDashes(normKey(lic.key)),
     plan_name: lic.plan_name,
     device_limit: lic.device_limit,
     status: licenseStatus(lic),
@@ -159,7 +244,13 @@ async function handleClientLicense(request, env, cors) {
   if (!key) return json({ ok: false, status: 'invalid', message: 'License key is required.' }, cors, 400);
 
   const lic = await getLicense(env, key);
-  if (!lic) return json({ ok: false, status: 'not_found', message: 'Invalid license key.' }, cors, 404);
+  // IMPORTANT: an unknown license key is an application-level error, NOT a
+  // missing route. HTTP 404 is reserved for "no such API endpoint" so the app
+  // can distinguish "invalid key" from "wrong/outdated server" and never shows
+  // a misleading "Server error (404)".
+  if (!lic) {
+    return json({ ok: false, status: 'not_found', message: 'Invalid license key.' }, cors, 200);
+  }
 
   const status = licenseStatus(lic);
   const devices = await listDevices(env, key);
@@ -169,7 +260,7 @@ async function handleClientLicense(request, env, cors) {
   const data = {
     valid: status === 'active',
     status,
-    license_key: key,
+    license_key: keyWithDashes(key),
     plan_name: lic.plan_name,
     device_limit: deviceLimit,
     device_count: deviceCount,
@@ -344,20 +435,20 @@ async function handleAdmin(request, env, url, cors, path) {
   // /api/admin/stats
   if (path === '/api/admin/stats') {
     const licList = await env.LICENSES_KV.list({ prefix: 'license:' });
-    const devList = await env.DEVICES_KV.list({ prefix: 'device:' });
-    const now = Date.now();
     let active = 0;
-    const licenses = [];
+    let devices = 0;
+    const seen = new Set();
     for (const k of licList.keys) {
-      const raw = await env.LICENSES_KV.get(k.name);
-      if (!raw) continue;
       try {
-        const lic = JSON.parse(raw);
+        // getLicense migrates legacy dashed keys to canonical and dedupes.
+        const lic = await getLicense(env, k.name.slice('license:'.length));
+        if (!lic) continue;
+        seen.add(normKey(lic.key));
         if (licenseStatus(lic) === 'active') active++;
-        licenses.push(pubLicense(lic));
+        devices += (await listDevices(env, lic.key)).length;
       } catch (_) {}
     }
-    return json({ ok: true, data: { licenses: licenses.length, active, devices: devList.keys.length } }, cors);
+    return json({ ok: true, data: { licenses: seen.size, active, devices } }, cors);
   }
 
   // /api/admin/licenses
@@ -365,12 +456,16 @@ async function handleAdmin(request, env, url, cors, path) {
     if (request.method === 'GET') {
       const list = await env.LICENSES_KV.list({ prefix: 'license:' });
       const out = [];
+      const seen = new Set();
       for (const k of list.keys) {
-        const raw = await env.LICENSES_KV.get(k.name);
-        if (!raw) continue;
         try {
-          const lic = JSON.parse(raw);
-          const devices = await listDevices(env, lic.key);
+          // getLicense migrates legacy dashed keys to canonical and dedupes.
+          const lic = await getLicense(env, k.name.slice('license:'.length));
+          if (!lic) continue;
+          const norm = normKey(lic.key);
+          if (seen.has(norm)) continue;
+          seen.add(norm);
+          const devices = await listDevices(env, norm);
           out.push({ ...pubLicense(lic), device_count: devices.length });
         } catch (_) {}
       }
@@ -424,10 +519,7 @@ async function handleAdmin(request, env, url, cors, path) {
         return json({ ok: true, message: 'License updated.', data: pubLicense(lic) }, cors);
       }
       if (action === 'delete') {
-        const key = normKey(body.key);
-        await env.LICENSES_KV.delete('license:' + key);
-        const devs = await env.DEVICES_KV.list({ prefix: 'device:' + key + ':' });
-        for (const k of devs.keys) await env.DEVICES_KV.delete(k.name);
+        await deleteLicenseData(env, normKey(body.key));
         return json({ ok: true, message: 'License deleted.' }, cors);
       }
       if (action === 'revoke' || action === 'ban') {
@@ -436,7 +528,10 @@ async function handleAdmin(request, env, url, cors, path) {
         if (!lic) return json({ ok: false, message: 'License not found.' }, cors, 404);
         lic.status = action === 'revoke' ? 'revoked' : 'banned';
         await putLicense(env, lic);
-        return json({ ok: true, message: `License ${action}ed.` }, cors);
+        return json({
+          ok: true,
+          message: `License ${action === 'revoke' ? 'revoked' : 'banned'}.`,
+        }, cors);
       }
       if (action === 'reactivate') {
         const key = normKey(body.key);
@@ -486,7 +581,7 @@ async function handleAdmin(request, env, url, cors, path) {
 
     const deviceId = decodeURIComponent(licMatch[3]);
     if (request.method === 'DELETE') {
-      await env.DEVICES_KV.delete('device:' + key + ':' + deviceId);
+      await deleteDevice(env, key, deviceId);
       return json({ ok: true, message: 'Device removed.' }, cors);
     }
     return json({ ok: false, message: 'Bad request.' }, cors, 400);
@@ -517,7 +612,17 @@ export default {
         return text(adminHtml(), 'text/html;charset=UTF-8');
       }
       if (path === '/api/public/health') {
-        return json({ ok: true, service: 'dns-changer', time: Date.now() }, cors);
+        // `api: 2` marks the current Worker contract (client license + release
+        // routes are active). The Android app refuses health OK for older
+        // answers so a stale deployment can be detected instead of silently
+        // failing activation with 404.
+        return json({
+          ok: true,
+          service: 'dns-changer',
+          api: 2,
+          endpoints: ['/api/client/license', '/api/client/release'],
+          time: Date.now(),
+        }, cors);
       }
       if (path === '/api/client/license' && request.method === 'POST') {
         return handleClientLicense(request, env, cors);
@@ -527,6 +632,16 @@ export default {
       }
       if (path.startsWith('/api/admin/')) {
         return handleAdmin(request, env, url, cors, path);
+      }
+      if (path.startsWith('/api/client/')) {
+        // JSON error instead of Cloudflare's HTML 404: an APK that hits this
+        // is talking to an outdated Worker and should say so.
+        return json({
+          ok: false,
+          code: 'route_not_found',
+          status: 'endpoint_missing',
+          message: 'License API endpoint not found. The deployed Worker is outdated — redeploy it.',
+        }, cors, 404);
       }
       return json({ ok: false, message: 'Not found.' }, cors, 404);
     } catch (e) {

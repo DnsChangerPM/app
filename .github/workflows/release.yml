@@ -100,17 +100,40 @@ jobs:
           flutter analyze
           flutter test
 
+      - name: Resolve and verify license API endpoint
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          CLOUDFLARE_WORKER_URL: ${{ secrets.CLOUDFLARE_WORKER_URL }}
+        run: |
+          URL="${API_BASE_URL:-${CLOUDFLARE_WORKER_URL:-}}"
+          URL="${URL%/}"
+          if [ -z "$URL" ]; then
+            echo "::error::Secret API_BASE_URL (or CLOUDFLARE_WORKER_URL) is required. Without it the APK would be built with the placeholder endpoint and license activation would fail with HTTP 404 in the installed app."
+            exit 1
+          fi
+
+          echo "Checking license server health at $URL ..."
+          BODY="$(curl -fsS --connect-timeout 15 --max-time 30 "$URL/api/public/health")" || {
+            echo "::error::License server is not reachable at $URL. Deploy the Worker first (see cloudflare/README.md), then re-run this release."
+            exit 1
+          }
+          echo "$BODY" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || {
+            echo "::error::The server at $URL did not report ok. Deploy the current cloudflare/src/index.js and re-run."
+            exit 1
+          }
+          echo "$BODY" | grep -q '"api"[[:space:]]*:[[:space:]]*2' || {
+            echo "::error::The server at $URL is an old Worker version (no license API contract). Redeploy cloudflare/src/index.js and re-run."
+            exit 1
+          }
+          echo "License API OK — building APK against $URL"
+          echo "API_URL=$URL" >> "$GITHUB_ENV"
+
       - name: Build release APK
         env:
-          API_BASE_URL: ${{ secrets.API_BASE_URL || secrets.CLOUDFLARE_WORKER_URL }}
+          API_URL: ${{ env.API_URL }}
         run: |
-          if [ -n "$API_BASE_URL" ]; then
-            echo "Using the configured build-time API endpoint."
-            flutter build apk --release --dart-define=API_BASE_URL="$API_BASE_URL"
-          else
-            echo "Using the default build-time API endpoint (not editable in the app)."
-            flutter build apk --release
-          fi
+          echo "Building with API endpoint: $API_URL"
+          flutter build apk --release --dart-define=API_BASE_URL="$API_URL"
 
       - name: Test native VPN lifecycle
         run: bash android/gradlew -p android testReleaseUnitTest --no-daemon
@@ -133,14 +156,14 @@ jobs:
 
       - name: Notify Cloudflare admin (disable old versions)
         env:
-          WORKER_URL: ${{ secrets.CLOUDFLARE_WORKER_URL }}
+          API_URL: ${{ env.API_URL }}
           ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
         run: |
-          if [ -z "$WORKER_URL" ] || [ -z "$ADMIN_KEY" ]; then
-            echo "Skipping worker notify: CLOUDFLARE_WORKER_URL / ADMIN_KEY secrets not set."
+          if [ -z "$ADMIN_KEY" ]; then
+            echo "Skipping worker notify: ADMIN_KEY secret not set."
             exit 0
           fi
-          curl --fail-with-body --retry 3 --connect-timeout 10 --max-time 30 -sS -X POST "$WORKER_URL/api/admin/config" \
+          curl --fail-with-body --retry 3 --connect-timeout 10 --max-time 30 -sS -X POST "$API_URL/api/admin/config" \
             -H "Content-Type: application/json" \
             -H "x-admin-key: $ADMIN_KEY" \
             -d "{\"min_version\":\"$VERSION\"}"
