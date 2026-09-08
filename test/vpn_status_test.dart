@@ -46,7 +46,7 @@ void main() {
     final status = VpnStatus.fromMap({'state': 'accepted', 'revision': 1});
     expect(status.phase, VpnPhase.error);
     expect(status.isConnected, isFalse);
-    final failure = const VpnException('https://private.example/secret');
+    const failure = VpnException('https://private.example/secret');
     expect(failure.toString(), isNot(contains('private.example')));
     expect(vpnErrorMessage('target_app_missing'), contains('برنامهٔ هدف'));
   });
