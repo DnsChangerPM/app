@@ -1,39 +1,73 @@
 import 'package:flutter/services.dart';
 
-/// Dart wrapper around the native VpnService (Kotlin).
+import '../models/vpn_status.dart';
+
+class VpnException implements Exception {
+  const VpnException(this.code);
+  final String code;
+  String get message => vpnErrorMessage(code);
+  @override
+  String toString() => message;
+}
+
+/// Native commands only acknowledge receipt; [states] / [getStatus] report when
+/// Android actually established, paused, revoked or closed its VPN interface.
 class VpnServiceController {
   static const MethodChannel _channel = MethodChannel('com.dnschanger.app/vpn');
+  static const EventChannel _events =
+      EventChannel('com.dnschanger.app/vpn_state');
+  static final Stream<VpnStatus> _states = _events.receiveBroadcastStream().map(
+        (event) => VpnStatus.fromMap(event as Map<dynamic, dynamic>),
+      );
 
-  /// Start the VPN with the given upstream DNS addresses.
-  /// Returns `true` if it started immediately, `false` if a permission dialog
-  /// was shown (the VPN will start automatically once granted).
-  Future<bool> start(List<String> addresses, {int port = 53, List<String> allowedPackages = const []}) async {
-    try {
-      final res = await _channel.invokeMethod<bool>('start', {
-        'addresses': addresses,
-        'port': port,
-        'allowedPackages': allowedPackages,
-      });
-      return res ?? false;
-    } on PlatformException {
-      return false;
-    }
+  Stream<VpnStatus> get states => _states;
+
+  Future<void> start(List<String> addresses,
+      {int port = 53, List<String> allowedPackages = const []}) {
+    return _command('start', {
+      'addresses': addresses,
+      'port': port,
+      'allowedPackages': allowedPackages,
+    });
   }
+
+  Future<void> pause() => _command('pause');
+  Future<void> resume() => _command('resume');
 
   Future<void> stop() async {
     try {
-      await _channel.invokeMethod('stop');
-    } on PlatformException {
-      // ignore
+      await _command('stop');
+    } on VpnException catch (error) {
+      // The Android-only update guard can also be built by Flutter widget tests.
+      if (error.code != 'unavailable') rethrow;
     }
   }
 
-  Future<bool> isRunning() async {
+  Future<VpnStatus> getStatus() async {
     try {
-      final res = await _channel.invokeMethod<bool>('isRunning');
-      return res ?? false;
-    } on PlatformException {
-      return false;
+      final data = await _channel.invokeMapMethod<String, dynamic>('getStatus');
+      if (data == null) throw const VpnException('unavailable');
+      return VpnStatus.fromMap(data);
+    } on PlatformException catch (error) {
+      throw VpnException(error.code);
+    } on MissingPluginException {
+      throw const VpnException('unavailable');
+    }
+  }
+
+  Future<bool> isRunning() async => (await getStatus()).isConnected;
+  Future<void> openNotificationSettings() =>
+      _command('openNotificationSettings');
+
+  Future<void> _command(String method,
+      [Map<String, dynamic>? arguments]) async {
+    try {
+      await _channel.invokeMethod<void>(method, arguments);
+    } on PlatformException catch (error) {
+      // Platform error messages can include native paths/addresses. Use codes.
+      throw VpnException(error.code);
+    } on MissingPluginException {
+      throw const VpnException('unavailable');
     }
   }
 }

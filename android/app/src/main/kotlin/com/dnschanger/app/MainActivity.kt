@@ -1,70 +1,93 @@
 package com.dnschanger.app
 
-import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-    private val channelName = "com.dnschanger.app/vpn"
-    private val vpnController = VpnController()
-    private val notificationPermissionCode = 101
+    private var vpnController: VpnController? = null
+    private var apkInstaller: ApkInstaller? = null
+    private var vpnChannel: MethodChannel? = null
+    private var updateChannel: MethodChannel? = null
+    private var statusChannel: EventChannel? = null
+    private var statusSink: EventChannel.EventSink? = null
+    private var statusListener: ((VpnSnapshot) -> Unit)? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "start" -> {
-                        val addresses = (call.argument<List<String>>("addresses") ?: emptyList())
-                            .filter { it.isNotBlank() }
-                        val port = (call.argument<Number>("port")?.toInt()) ?: 53
-                        val allowedPackages = (call.argument<List<String>>("allowedPackages") ?: emptyList())
-                            .filter { it.isNotBlank() }
-
-                        // Android 13+: ask for the notification permission so the
-                        // persistent "connected" notification is visible. This is
-                        // best-effort and does not block starting the VPN.
-                        requestNotificationPermission()
-
-                        val permissionIntent = VpnController.prepare(this)
-                        if (permissionIntent != null) {
-                            vpnController.storePending(this, addresses, port, allowedPackages)
-                            startActivityForResult(permissionIntent, VpnController.VPN_REQUEST_CODE)
-                            result.success(false)
-                        } else {
-                            val started = vpnController.start(this, addresses, port, allowedPackages)
-                            result.success(started)
+        val messenger = flutterEngine.dartExecutor.binaryMessenger
+        vpnController = VpnController(this)
+        apkInstaller = ApkInstaller(this)
+        vpnChannel = MethodChannel(messenger, VpnController.CHANNEL).also { it.setMethodCallHandler(vpnController) }
+        updateChannel = MethodChannel(messenger, ApkInstaller.CHANNEL).also { it.setMethodCallHandler(apkInstaller) }
+        statusChannel = EventChannel(messenger, VpnController.EVENTS).also {
+            it.setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    removeStatusListener()
+                    statusSink = events
+                    val listener: (VpnSnapshot) -> Unit = { snapshot ->
+                        runOnUiThread {
+                            statusSink?.success(snapshot.toMap(VpnNotifications.enabled(this@MainActivity)))
                         }
                     }
-                    "stop" -> {
-                        vpnController.stop(this)
-                        result.success(true)
-                    }
-                    "isRunning" -> result.success(vpnController.isRunning)
-                    else -> result.notImplemented()
+                    statusListener = listener
+                    VpnRuntime.addListener(listener)
+                    publishStatus()
                 }
-            }
+
+                override fun onCancel(arguments: Any?) = removeStatusListener()
+            })
+        }
     }
 
-    private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    notificationPermissionCode
-                )
-            }
-        }
+    private fun publishStatus() {
+        val current = VpnRuntime.snapshot
+        // A permission/channel change is a new observation too. Advance its
+        // revision so an older getStatus reply cannot restore a stale warning.
+        VpnRuntime.publish(current.phase, current.errorCode)
+    }
+
+    private fun removeStatusListener() {
+        statusListener?.let { VpnRuntime.removeListener(it) }
+        statusListener = null
+        statusSink = null
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Notification permissions/channel settings may have changed outside
+        // Flutter, even if the tunnel state itself is unchanged.
+        publishStatus()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VpnController.VPN_REQUEST_CODE) {
-            vpnController.onActivityResult(resultCode == RESULT_OK)
-        }
+        if (apkInstaller?.onActivityResult(requestCode, resultCode) == true) return
+        vpnController?.onActivityResult(requestCode, resultCode)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        vpnController?.onNotificationPermissionResult(requestCode)
+        publishStatus()
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        removeStatusListener()
+        vpnChannel?.setMethodCallHandler(null)
+        updateChannel?.setMethodCallHandler(null)
+        statusChannel?.setStreamHandler(null)
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    override fun onDestroy() {
+        removeStatusListener()
+        vpnController?.dispose()
+        vpnController = null
+        apkInstaller?.dispose()
+        apkInstaller = null
+        super.onDestroy()
     }
 }

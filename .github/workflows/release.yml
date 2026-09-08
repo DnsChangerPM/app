@@ -40,13 +40,15 @@ jobs:
           cache: true
 
       - name: Determine version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             V="${GITHUB_REF_NAME#v}"
           else
-            V="${{ github.event.inputs.version }}"
+            V="$INPUT_VERSION"
           fi
-          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Version must be in X.Y.Z format (got: $V)"; exit 1; }
+          echo "$V" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || { echo "::error::Version must be in X.Y.Z format without leading zeroes"; exit 1; }
           echo "VERSION=$V" >> "$GITHUB_ENV"
 
       - name: Apply version
@@ -55,22 +57,32 @@ jobs:
           MAJOR=$(echo "$V" | cut -d. -f1)
           MINOR=$(echo "$V" | cut -d. -f2)
           PATCH=$(echo "$V" | cut -d. -f3)
+          # Keep the existing versionCode scheme monotonic (including 1.0.1+10001).
+          if [ "${#MINOR}" -gt 2 ] || [ "${#PATCH}" -gt 2 ] || [ "${#MAJOR}" -gt 6 ] || [ "$MAJOR" -gt 210000 ]; then
+            echo "::error::Minor/patch must be 0..99 and major at most 210000."
+            exit 1
+          fi
           CODE=$((MAJOR*10000 + MINOR*100 + PATCH))
+          if [ "$CODE" -lt 1 ] || [ "$CODE" -gt 2100000000 ]; then
+            echo "::error::Version code is outside Android's supported range."
+            exit 1
+          fi
           sed -i -E "s/^version: .*/version: $V+$CODE/" pubspec.yaml
           echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
 
-      - name: Configure signing (if secrets are set)
+      - name: Require stable release signing
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::warning::No KEYSTORE_BASE64 secret set — APK will be signed with the debug key."
-            echo "::warning::Users will NOT be able to update between releases. Run scripts/gen_keystore.sh and add the secrets."
-            exit 0
-          fi
+          for SECRET in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!SECRET}" ]; then
+              echo "::error::$SECRET is required to publish an installable update. Configure the SAME signing key used by the installed release."
+              exit 1
+            fi
+          done
           echo "$KEYSTORE_BASE64" | base64 -d > android/app/key.p12
           cat > android/key.properties <<EOF
           storePassword=$KEYSTORE_PASSWORD
@@ -83,17 +95,25 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Analyze and test
+        run: |
+          flutter analyze
+          flutter test
+
       - name: Build release APK
         env:
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL || secrets.CLOUDFLARE_WORKER_URL }}
         run: |
           if [ -n "$API_BASE_URL" ]; then
-            echo "Baking in API base URL: $API_BASE_URL"
+            echo "Using the configured build-time API endpoint."
             flutter build apk --release --dart-define=API_BASE_URL="$API_BASE_URL"
           else
-            echo "No API_BASE_URL secret — using the app default (change it in Settings)."
+            echo "Using the default build-time API endpoint (not editable in the app)."
             flutter build apk --release
           fi
+
+      - name: Test native VPN lifecycle
+        run: bash android/gradlew -p android testReleaseUnitTest --no-daemon
 
       - name: Rename APK
         run: |
@@ -120,7 +140,7 @@ jobs:
             echo "Skipping worker notify: CLOUDFLARE_WORKER_URL / ADMIN_KEY secrets not set."
             exit 0
           fi
-          curl -sS -X POST "$WORKER_URL/api/admin/config" \
+          curl --fail-with-body --retry 3 --connect-timeout 10 --max-time 30 -sS -X POST "$WORKER_URL/api/admin/config" \
             -H "Content-Type: application/json" \
             -H "x-admin-key: $ADMIN_KEY" \
             -d "{\"min_version\":\"$VERSION\"}"

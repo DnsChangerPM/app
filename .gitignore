@@ -18,6 +18,8 @@ android/app/.cxx/
 android/key.properties
 *.jks
 *.keystore
+*.p12
+*.apk
 
 # Cloudflare worker
 cloudflare/.dev.vars

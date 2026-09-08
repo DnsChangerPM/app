@@ -1,72 +1,191 @@
 package com.dnschanger.app
 
+import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
+import android.os.Build
+import androidx.core.content.ContextCompat
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
 
-class VpnController {
+/** Serializes the two Android permission dialogs; command success is only ACK. */
+class VpnController(private val activity: Activity) : MethodChannel.MethodCallHandler {
     companion object {
+        const val CHANNEL = "com.dnschanger.app/vpn"
+        const val EVENTS = "com.dnschanger.app/vpn_state"
         const val VPN_REQUEST_CODE = 24
-        fun prepare(context: Context): Intent? = VpnService.prepare(context)
-    }
+        const val NOTIFICATION_PERMISSION_CODE = 101
 
-    @Volatile
-    var isRunning: Boolean = false
-        private set
-
-    private var appContext: Context? = null
-    private var pendingAddresses: List<String> = emptyList()
-    private var pendingPort: Int = 53
-    private var pendingAllowed: List<String> = emptyList()
-
-    fun storePending(context: Context, addresses: List<String>, port: Int, allowedPackages: List<String>) {
-        appContext = context.applicationContext
-        pendingAddresses = addresses
-        pendingPort = port
-        pendingAllowed = allowedPackages
-    }
-
-    fun start(context: Context, addresses: List<String>, port: Int, allowedPackages: List<String>): Boolean {
-        appContext = context.applicationContext
-        pendingAddresses = addresses
-        pendingPort = port
-        pendingAllowed = allowedPackages
-        return startService()
-    }
-
-    fun onActivityResult(granted: Boolean) {
-        if (granted) {
-            startService()
-        } else {
-            isRunning = false
+        fun stopNative(context: Context) {
+            VpnRuntime.cancelQueuedStarts()
+            val service = Intent(context, DnsVpnService::class.java)
+            val previous = VpnRuntime.snapshot
+            if (VpnRuntime.serviceAlive) {
+                VpnRuntime.publish(VpnPhase.STOPPING)
+                try {
+                    // Android can keep a VpnService bound while its TUN exists.
+                    // stopService alone is not enough: close TUN/notification in
+                    // ACTION_STOP first, then let the service call stopSelf.
+                    context.startService(service.setAction(DnsVpnService.ACTION_STOP))
+                    return
+                } catch (_: Exception) {
+                    VpnRuntime.publish(previous.phase, "command_failed")
+                    throw VpnFailure("command_failed")
+                }
+            }
+            // Cancel a queued start/permission flow without creating a service.
+            context.stopService(service)
+            VpnRuntime.publish(VpnPhase.DISCONNECTED)
         }
     }
 
-    private fun startService(): Boolean {
-        val ctx = appContext ?: return false
-        val intent = Intent(ctx, DnsVpnService::class.java)
-        intent.action = DnsVpnService.ACTION_START
-        intent.putStringArrayListExtra(DnsVpnService.EXTRA_ADDRESSES, ArrayList(pendingAddresses))
-        intent.putExtra(DnsVpnService.EXTRA_PORT, pendingPort)
-        intent.putStringArrayListExtra(DnsVpnService.EXTRA_ALLOWED_PACKAGES, ArrayList(pendingAllowed))
-        try {
-            ctx.startService(intent)
-            return true
-        } catch (e: Exception) {
-            return false
-        }
-    }
+    private data class Request(val config: VpnConfig?, val resume: Boolean)
+    private var pending: Request? = null
 
-    fun stop(context: Context) {
-        val intent = Intent(context, DnsVpnService::class.java)
-        intent.action = DnsVpnService.ACTION_STOP
+    fun status(): Map<String, Any?> = VpnRuntime.snapshot.toMap(VpnNotifications.enabled(activity))
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
-            context.startService(intent)
+            when (call.method) {
+                "start" -> {
+                    requirePhase(VpnPhase.DISCONNECTED, VpnPhase.ERROR)
+                    val config = VpnConfig.parse(
+                        call.argument<List<String>>("addresses") ?: emptyList(),
+                        call.argument<Number>("port")?.toInt() ?: 53,
+                        call.argument<List<String>>("allowedPackages") ?: emptyList()
+                    )
+                    if (activity.packageName in config.allowedPackages) throw VpnFailure("invalid_target")
+                    begin(Request(config, false))
+                    result.success(null)
+                }
+                "pause" -> {
+                    requirePhase(VpnPhase.CONNECTED)
+                    VpnRuntime.publish(VpnPhase.PAUSING)
+                    try {
+                        activity.startService(Intent(activity, DnsVpnService::class.java).setAction(DnsVpnService.ACTION_PAUSE))
+                    } catch (_: Exception) {
+                        VpnRuntime.publish(VpnPhase.CONNECTED, "command_failed")
+                        throw VpnFailure("command_failed")
+                    }
+                    result.success(null)
+                }
+                "resume" -> {
+                    requirePhase(VpnPhase.PAUSED)
+                    begin(Request(null, true))
+                    result.success(null)
+                }
+                "stop" -> {
+                    stop()
+                    result.success(null)
+                }
+                "getStatus" -> result.success(status())
+                "isRunning" -> result.success(VpnRuntime.snapshot.phase == VpnPhase.CONNECTED)
+                "openNotificationSettings" -> {
+                    activity.startActivity(VpnNotifications.settingsIntent(activity))
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        } catch (failure: VpnFailure) {
+            result.error(failure.code, "VPN operation could not be completed", null)
         } catch (_: Exception) {
+            result.error("command_failed", "VPN operation could not be completed", null)
         }
     }
 
-    fun onServiceState(running: Boolean) {
-        isRunning = running
+    private fun requirePhase(vararg phases: VpnPhase) {
+        if (VpnRuntime.snapshot.phase != VpnPhase.REQUESTING_PERMISSION) pending = null
+        if (pending != null || VpnRuntime.snapshot.phase !in phases) throw VpnFailure("busy")
+    }
+
+    private fun begin(request: Request) {
+        pending = request
+        VpnRuntime.publish(VpnPhase.REQUESTING_PERMISSION)
+        val prefs = activity.getSharedPreferences("vpn_permissions", Context.MODE_PRIVATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !prefs.getBoolean("notification_requested", false)) {
+            prefs.edit().putBoolean("notification_requested", true).apply()
+            try {
+                // Never overlap this with VpnService.prepare's permission dialog.
+                activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_CODE)
+                return
+            } catch (_: Exception) { }
+        }
+        requestVpnConsent()
+    }
+
+    private fun currentRequest(): Request? {
+        // Stop/update-gate/notification disconnect or OS revocation can cancel a
+        // flow while a system dialog is still open. Its later result is stale.
+        if (VpnRuntime.snapshot.phase != VpnPhase.REQUESTING_PERMISSION) pending = null
+        return pending
+    }
+
+    private fun requestVpnConsent() {
+        if (currentRequest() == null) return
+        try {
+            val intent = VpnService.prepare(activity)
+            if (intent == null) dispatchPending() else activity.startActivityForResult(intent, VPN_REQUEST_CODE)
+        } catch (_: Exception) {
+            rejectPending("permission_required")
+        }
+    }
+
+    fun onNotificationPermissionResult(requestCode: Int): Boolean {
+        if (requestCode != NOTIFICATION_PERMISSION_CODE) return false
+        // Denial does not mean VPN consent was denied. Android can run an FGS
+        // without a drawer notification; the UI explains how to enable it.
+        requestVpnConsent()
+        return true
+    }
+
+    fun onActivityResult(requestCode: Int, resultCode: Int): Boolean {
+        if (requestCode != VPN_REQUEST_CODE) return false
+        if (currentRequest() == null) return true
+        if (resultCode == Activity.RESULT_OK) dispatchPending() else rejectPending("permission_denied")
+        return true
+    }
+
+    private fun dispatchPending() {
+        val request = currentRequest() ?: return
+        pending = null
+        VpnRuntime.publish(VpnPhase.CONNECTING)
+        val intent = Intent(activity, DnsVpnService::class.java)
+            .setAction(if (request.resume) DnsVpnService.ACTION_RESUME else DnsVpnService.ACTION_START)
+            .putExtra(DnsVpnService.EXTRA_START_TICKET, VpnRuntime.nextStartTicket())
+        request.config?.let { config ->
+            intent.putStringArrayListExtra(DnsVpnService.EXTRA_ADDRESSES, ArrayList(config.encodedAddresses))
+            intent.putStringArrayListExtra(DnsVpnService.EXTRA_ALLOWED_PACKAGES, ArrayList(config.allowedPackages))
+            intent.putExtra(DnsVpnService.EXTRA_PORT, 53)
+        }
+        try {
+            // Uses startForegroundService on Android 8+, startService on 7.
+            ContextCompat.startForegroundService(activity, intent)
+        } catch (_: Exception) {
+            VpnRuntime.publish(if (request.resume && VpnRuntime.serviceAlive) VpnPhase.PAUSED else VpnPhase.ERROR, "start_failed")
+        }
+    }
+
+    private fun rejectPending(code: String) {
+        val request = pending ?: return
+        pending = null
+        VpnRuntime.publish(if (request.resume && VpnRuntime.serviceAlive) VpnPhase.PAUSED else VpnPhase.DISCONNECTED, code)
+    }
+
+    fun stop() {
+        pending = null
+        stopNative(activity)
+    }
+
+    fun dispose() {
+        if (pending != null && VpnRuntime.snapshot.phase == VpnPhase.REQUESTING_PERMISSION) {
+            rejectPending("permission_denied")
+        }
+        pending = null
+        // Closing the activity must not stop an active/paused foreground VPN.
     }
 }
