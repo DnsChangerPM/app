@@ -64,8 +64,8 @@ function adminKeyOf(cfg, request, url) {
 
 function authorized(cfg, request, url, env) {
   const key = adminKeyOf(cfg, request, url);
-  if (!cfg.admin_key) return false;
-  if (key && key === cfg.admin_key) return true;
+  if (!key) return false;
+  if (cfg.admin_key && key === cfg.admin_key) return true;
   if (env.ADMIN_KEY && key === env.ADMIN_KEY) return true;
   return false;
 }
