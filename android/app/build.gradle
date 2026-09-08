@@ -46,7 +46,8 @@ android {
 
     defaultConfig {
         applicationId "com.dnschanger.app"
-        minSdk 21
+        // Android 7.0 (API 24) up to the latest Android versions.
+        minSdk 24
         targetSdk 34
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
