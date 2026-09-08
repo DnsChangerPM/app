@@ -1,0 +1,104 @@
+name: Build & Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'App version (e.g. 1.2.0) — this becomes the release tag "vX.Y.Z"'
+        required: true
+        type: string
+      notes:
+        description: 'Release notes (optional)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Validate version
+        run: |
+          V="${{ github.event.inputs.version }}"
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Version must be in X.Y.Z format"; exit 1; }
+
+      - name: Apply version
+        run: |
+          V="${{ github.event.inputs.version }}"
+          MAJOR=$(echo "$V" | cut -d. -f1)
+          MINOR=$(echo "$V" | cut -d. -f2)
+          PATCH=$(echo "$V" | cut -d. -f3)
+          CODE=$((MAJOR*10000 + MINOR*100 + PATCH))
+          sed -i -E "s/^version: .*/version: $V+$CODE/" pubspec.yaml
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
+
+      - name: Configure signing (if secrets are set)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::No KEYSTORE_BASE64 secret set — APK will be signed with the debug key."
+            echo "::warning::Users will NOT be able to update between releases. Run scripts/gen_keystore.sh and add the secrets."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/key.jks
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=key.jks
+          EOF
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Rename APK
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk "DNS-Changer-v${{ github.event.inputs.version }}.apk"
+          ls -la *.apk
+
+      - name: Publish GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ github.event.inputs.version }}"
+          name: "DNS Changer v${{ github.event.inputs.version }}"
+          body: "${{ github.event.inputs.notes }}"
+          files: "DNS-Changer-v${{ github.event.inputs.version }}.apk"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      - name: Notify Cloudflare admin (disable old versions)
+        if: ${{ secrets.CLOUDFLARE_WORKER_URL != '' && secrets.ADMIN_KEY != '' }}
+        run: |
+          curl -sS -X POST "${{ secrets.CLOUDFLARE_WORKER_URL }}/api/admin/config" \
+            -H "Content-Type: application/json" \
+            -H "x-admin-key: ${{ secrets.ADMIN_KEY }}" \
+            -d "{\"min_version\":\"${{ github.event.inputs.version }}\"}"
