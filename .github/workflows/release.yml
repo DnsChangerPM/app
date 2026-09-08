@@ -71,12 +71,13 @@ jobs:
             echo "::warning::Users will NOT be able to update between releases. Run scripts/gen_keystore.sh and add the secrets."
             exit 0
           fi
-          echo "$KEYSTORE_BASE64" | base64 -d > android/app/key.jks
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/key.p12
           cat > android/key.properties <<EOF
           storePassword=$KEYSTORE_PASSWORD
           keyPassword=$KEY_PASSWORD
           keyAlias=$KEY_ALIAS
-          storeFile=key.jks
+          storeFile=key.p12
+          storeType=PKCS12
           EOF
 
       - name: Get dependencies
