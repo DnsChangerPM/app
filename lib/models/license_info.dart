@@ -31,7 +31,9 @@ class LicenseInfo {
     final expiresRaw = data['expires_at'];
     return LicenseInfo(
       valid: json['ok'] == true || data['valid'] == true,
-      status: (data['status'] as String?) ?? (json['status'] as String?) ?? 'unknown',
+      status: (data['status'] as String?) ??
+          (json['status'] as String?) ??
+          'unknown',
       licenseKey: data['license_key'] as String?,
       planName: data['plan_name'] as String?,
       deviceLimit: data['device_limit'] as int?,
@@ -42,8 +44,9 @@ class LicenseInfo {
     );
   }
 
-  /// The worker sends subscription DNS addresses base64-encoded so they are
-  /// never exposed in plain text. Support both plain and encoded forms.
+  /// The worker encodes subscription DNS addresses as base64 for transport.
+  /// This is not encryption; privacy in the UI is handled by the server widgets.
+  /// Support both plain and encoded forms.
   static List<String> _parseDnsServers(Map<String, dynamic> data) {
     final plain = data['dns_servers'] as List?;
     if (plain != null) return plain.map((e) => e.toString()).toList();

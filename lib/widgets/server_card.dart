@@ -39,12 +39,18 @@ class ServerCard extends StatelessWidget {
                   width: 44,
                   height: 44,
                   decoration: BoxDecoration(
-                    color: (selected ? const Color(0xFF3AA6FF) : const Color(0xFF1C2A44))
+                    color: (selected
+                            ? const Color(0xFF3AA6FF)
+                            : const Color(0xFF1C2A44))
                         .withOpacity(0.25),
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: Icon(
-                    locked ? Icons.lock_outline : Icons.dns,
+                    locked
+                        ? Icons.lock_outline
+                        : server.isCustom
+                            ? Icons.tune
+                            : Icons.dns,
                     color: selected ? const Color(0xFF3AA6FF) : Colors.white54,
                   ),
                 ),
@@ -65,32 +71,40 @@ class ServerCard extends StatelessWidget {
                           if (locked) ...[
                             const SizedBox(width: 6),
                             Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 2),
                               decoration: BoxDecoration(
-                                color: const Color(0xFFFFC107).withOpacity(0.15),
+                                color:
+                                    const Color(0xFFFFC107).withOpacity(0.15),
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: const Text(
                                 'LOCKED',
-                                style: TextStyle(fontSize: 10, color: Color(0xFFFFC107)),
+                                style: TextStyle(
+                                    fontSize: 10, color: Color(0xFFFFC107)),
                               ),
                             ),
                           ],
                           if (server.isPremium && !locked) ...[
                             const SizedBox(width: 6),
-                            const Icon(Icons.workspace_premium, size: 16, color: Color(0xFF00D1B2)),
+                            const Icon(Icons.workspace_premium,
+                                size: 16, color: Color(0xFF00D1B2)),
                           ],
                         ],
                       ),
                       const SizedBox(height: 2),
                       Text(
                         server.description,
-                        style: const TextStyle(color: Colors.white54, fontSize: 13),
+                        style: const TextStyle(
+                            color: Colors.white54, fontSize: 13),
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        server.addresses.join('  •  '),
-                        style: const TextStyle(color: Colors.white38, fontSize: 12),
+                        server.isPremium
+                            ? 'Private subscription DNS'
+                            : server.addresses.join('  •  '),
+                        style: const TextStyle(
+                            color: Colors.white38, fontSize: 12),
                       ),
                     ],
                   ),

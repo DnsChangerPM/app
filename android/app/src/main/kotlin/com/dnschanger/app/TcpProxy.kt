@@ -5,11 +5,12 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.io.IOException
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
 /**
@@ -22,6 +23,7 @@ class TcpProxy(
     private val srcPort: Int,
     private val dstAddr: ByteArray,
     private val upstreams: List<Pair<String, Int>>,
+    private val protectSocket: (Socket) -> Boolean,
     private val write: (ByteArray) -> Unit,
     private val onClose: (TcpProxy) -> Unit
 ) {
@@ -41,10 +43,11 @@ class TcpProxy(
     private var serverSeq = Random.nextInt(0, Int.MAX_VALUE)
     private val reassembly = ByteArrayOutputStream()
 
+    private val socketLock = Any()
     private var socket: Socket? = null
     private var upstreamOut: OutputStream? = null
     private var upstreamThread: Thread? = null
-    private val lastActive = AtomicInteger(0)
+    private val lastActive = AtomicLong(0)
     private val closed = AtomicBoolean(false)
 
     fun isIdle(ms: Long): Boolean = System.currentTimeMillis() - lastActive.get() > ms
@@ -52,15 +55,19 @@ class TcpProxy(
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         state = State.CLOSED
-        try {
-            socket?.close()
-        } catch (_: Exception) {
+        upstreamThread?.interrupt()
+        val closing = synchronized(socketLock) {
+            val current = socket
+            socket = null
+            current
         }
+        // Do not wait for handleData's monitor while a peer stalls a write.
+        try { closing?.close() } catch (_: Exception) { }
     }
 
     fun feed(segment: ByteArray, offset: Int, length: Int, flags: Int) {
         if (closed.get()) return
-        lastActive.set(System.currentTimeMillis().toInt())
+        lastActive.set(System.currentTimeMillis())
         if (length < offset + 20) return
 
         val seq = readInt(segment, offset + 4)
@@ -120,6 +127,7 @@ class TcpProxy(
 
     @Synchronized
     private fun handleData(payload: ByteArray) {
+        if (closed.get()) return
         reassembly.write(payload)
         val buf = reassembly.toByteArray()
         var pos = 0
@@ -151,11 +159,18 @@ class TcpProxy(
 
     private fun connectUpstream() {
         val upstream = upstreams.firstOrNull() ?: return
-        upstreamThread = Thread({
+        upstreamThread = Thread(upstream@{
             try {
                 val s = Socket()
+                synchronized(socketLock) {
+                    if (closed.get()) { s.close(); return@upstream }
+                    // Save it before connect() so pause/disconnect can cancel a
+                    // pending TCP connection, not leave it alive for 10 seconds.
+                    socket = s
+                }
+                if (!protectSocket(s)) throw IOException("DNS socket protection failed")
                 s.connect(InetSocketAddress(upstream.first, upstream.second), 10_000)
-                socket = s
+                if (closed.get()) return@upstream
                 upstreamOut = BufferedOutputStream(s.getOutputStream())
                 // Forward anything the client sent while we were connecting.
                 val pending = synchronized(this) {
@@ -169,7 +184,13 @@ class TcpProxy(
                 val input: InputStream = BufferedInputStream(s.getInputStream())
                 val lenBuf = ByteArray(2)
                 while (!closed.get()) {
-                    if (input.read(lenBuf) != 2) break
+                    var headerRead = 0
+                    while (headerRead < 2) {
+                        val count = input.read(lenBuf, headerRead, 2 - headerRead)
+                        if (count < 0) break
+                        headerRead += count
+                    }
+                    if (headerRead != 2) break
                     val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
                     val response = ByteArray(respLen)
                     var read = 0
@@ -182,7 +203,7 @@ class TcpProxy(
                     sendDnsResponse(response)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "upstream error", e)
+                if (!closed.get()) Log.w(TAG, "upstream DNS connection failed")
             } finally {
                 if (!closed.get()) onClose(this)
             }
@@ -200,6 +221,7 @@ class TcpProxy(
     }
 
     private fun sendSegment(flags: Int, seq: Int, ack: Int, payload: ByteArray) {
+        if (closed.get()) return
         val pkt = PacketUtils.buildTcpResponse(dstAddr, srcAddr, 53, srcPort, seq, ack, flags, payload)
         try {
             write(pkt)

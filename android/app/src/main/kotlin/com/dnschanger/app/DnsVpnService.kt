@@ -1,20 +1,21 @@
 package com.dnschanger.app
 
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
-import android.util.Log
+import androidx.core.app.ServiceCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -22,343 +23,353 @@ import java.util.concurrent.atomic.AtomicLong
 
 class DnsVpnService : VpnService() {
     companion object {
-        private const val TAG = "DnsVpnService"
         const val ACTION_START = "com.dnschanger.app.START"
+        const val ACTION_PAUSE = "com.dnschanger.app.PAUSE"
+        const val ACTION_RESUME = "com.dnschanger.app.RESUME"
         const val ACTION_STOP = "com.dnschanger.app.STOP"
         const val EXTRA_ADDRESSES = "addresses"
         const val EXTRA_PORT = "port"
         const val EXTRA_ALLOWED_PACKAGES = "allowed_packages"
-        private const val CHANNEL_ID = "dns_vpn_channel"
-        private const val NOTIFICATION_ID = 1
+        const val EXTRA_START_TICKET = "start_ticket"
         private const val MTU = 1500
-        private const val WATCHDOG_IDLE_MS = 5 * 60_000L
 
         const val VPN_IPV4 = "10.0.0.2"
         const val VPN_DNS_IPV4 = "10.0.0.1"
         const val VPN_IPV6 = "2001:db8::2"
         const val VPN_DNS_IPV6 = "2001:db8::1"
 
-        // Common public resolvers that apps may hardcode. We route them so their
-        // queries are also captured and answered by the chosen upstream.
-        private val EXTRA_V4_RESOLVERS = listOf(
+        private val EXTRA_RESOLVERS = listOf(
             "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112",
-            "208.67.222.222", "208.67.220.220", "94.140.14.14", "94.140.15.15"
-        )
-        private val EXTRA_V6_RESOLVERS = listOf(
+            "208.67.222.222", "208.67.220.220", "94.140.14.14", "94.140.15.15",
             "2606:4700:4700::1111", "2606:4700:4700::1001", "2001:4860:4860::8888",
             "2001:4860:4860::8844", "2620:fe::fe", "2620:fe::9", "2620:119:35::35", "2620:119:53::53"
         )
-
-        @Volatile
-        var running = false
-            private set
-
-        @Volatile
-        var currentUpstreams: List<String> = emptyList()
-            private set
     }
 
-    private var vpnInterface: ParcelFileDescriptor? = null
-    private var output: FileOutputStream? = null
-    private var resolver: DnsResolver? = null
-    private var readerThread: Thread? = null
-    private var upstreams: List<Pair<String, Int>> = emptyList()
-    private var currentPort: Int = 53
-    private var currentAllowedPackages: List<String> = emptyList()
-    private val tcpProxies = ConcurrentHashMap<Int, TcpProxy>()
+    private class Tunnel(val fd: ParcelFileDescriptor, val generation: Long, val config: VpnConfig) {
+        val input = FileInputStream(fd.fileDescriptor)
+        val output = FileOutputStream(fd.fileDescriptor)
+        val tcp = ConcurrentHashMap<String, TcpProxy>()
+        var resolver: DnsResolver? = null
+        var reader: Thread? = null
+    }
+
+    @Volatile private var tunnel: Tunnel? = null
+    private val generation = AtomicLong(0)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val lastTraffic = AtomicLong(0)
+    private val networkTracker = UnderlyingNetworkTracker()
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var foreground = false
+    private lateinit var session: VpnSession
+    private val reconnect = Runnable {
+        if (tunnel != null && session.phase == VpnPhase.CONNECTED &&
+            VpnRuntime.snapshot.phase == VpnPhase.CONNECTED) session.reconnect()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        VpnRuntime.serviceAlive = true
+        VpnNotifications.createChannel(this)
+        session = VpnSession(object : VpnPlatform {
+            override fun startForeground(phase: VpnPhase) = showForeground(phase)
+            override fun updateNotification(phase: VpnPhase, errorCode: String?) = showNotification(phase, errorCode)
+            override fun openTunnel(config: VpnConfig) = establishTunnel(config)
+            override fun closeTunnel() = releaseTunnel()
+            override fun stopForeground() = removeNotification()
+            override fun stopService() = stopSelf()
+        }) { phase, error -> VpnRuntime.publish(phase, error) }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) return START_NOT_STICKY
-        when (intent.action) {
-            ACTION_START -> {
-                val addresses = intent.getStringArrayListExtra(EXTRA_ADDRESSES) ?: arrayListOf()
-                val port = intent.getIntExtra(EXTRA_PORT, 53)
-                val allowedPackages = intent.getStringArrayListExtra(EXTRA_ALLOWED_PACKAGES) ?: arrayListOf()
-                startInternal(addresses, port, allowedPackages)
-            }
-            ACTION_STOP -> stopInternal()
+        if (intent == null) {
+            if (session.config == null) session.stop()
+            return START_NOT_STICKY
         }
+        try {
+            when (intent.action) {
+                ACTION_START -> {
+                    if (!VpnRuntime.isCurrentStart(intent.getLongExtra(EXTRA_START_TICKET, -1))) {
+                        discardQueuedStart(startId)
+                        return START_NOT_STICKY
+                    }
+                    // Fulfil startForegroundService's deadline even for invalid
+                    // input. VpnSession also guarantees foreground-before-TUN.
+                    showForeground(VpnPhase.CONNECTING)
+                    val config = VpnConfig.parse(
+                        intent.getStringArrayListExtra(EXTRA_ADDRESSES) ?: emptyList(),
+                        intent.getIntExtra(EXTRA_PORT, 53),
+                        intent.getStringArrayListExtra(EXTRA_ALLOWED_PACKAGES) ?: emptyList()
+                    )
+                    session.start(config)
+                }
+                ACTION_PAUSE -> {
+                    if (session.config == null) session.stop() else session.pause()
+                }
+                ACTION_RESUME -> {
+                    val accepted = if (intent.hasExtra(EXTRA_START_TICKET)) {
+                        VpnRuntime.isCurrentStart(intent.getLongExtra(EXTRA_START_TICKET, -1))
+                    } else {
+                        VpnRuntime.snapshot.phase == VpnPhase.PAUSED
+                    }
+                    if (!accepted) {
+                        discardQueuedStart(startId)
+                        return START_NOT_STICKY
+                    }
+                    showForeground(VpnPhase.CONNECTING)
+                    when {
+                        session.config == null -> session.stop("no_session")
+                        session.phase == VpnPhase.CONNECTED -> showNotification(VpnPhase.CONNECTED)
+                        VpnService.prepare(this) != null -> session.permissionRequired()
+                        else -> session.resume()
+                    }
+                }
+                ACTION_STOP -> {
+                    VpnRuntime.cancelQueuedStarts()
+                    session.stop()
+                }
+                else -> if (session.config == null) session.stop()
+            }
+        } catch (failure: VpnFailure) {
+            session.stop(failure.code)
+        } catch (_: Exception) {
+            session.stop("start_failed")
+        }
+        // Never silently reconnect after Android kills/stops the app. A paused
+        // session lives in this foreground service, not in an auto-start alarm.
         return START_NOT_STICKY
     }
 
-    private fun startInternal(addresses: List<String>, port: Int, allowedPackages: List<String>) {
-        if (running) {
-            stopInternal()
-            Thread.sleep(200)
+    private fun discardQueuedStart(startId: Int) {
+        // A stop/update can arrive while startForegroundService is still queued.
+        // Satisfy Android's foreground deadline, but never establish a stale TUN
+        // or let an old stopSelf destroy a newer start request.
+        if (session.config == null) {
+            showForeground(VpnPhase.CONNECTING)
+            removeNotification()
+            stopSelf(startId)
         }
-        currentPort = port
-        currentAllowedPackages = allowedPackages
-        upstreams = addresses
-            .mapNotNull { parseHostPort(it, port) }
-            .ifEmpty { listOf(parseHostPort("1.1.1.1", 53)!!) }
-        currentUpstreams = upstreams.map { it.first }
+    }
+
+    private fun establishTunnel(config: VpnConfig) {
+        if (VpnService.prepare(this) != null) throw VpnFailure("permission_required")
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork
+        val properties = network?.let { cm.getLinkProperties(it) }
+        val fingerprint = if (network != null && properties != null) fingerprint(network, properties) else null
 
         val builder = Builder()
-        builder.setSession("DNS Changer")
-        builder.setMtu(MTU)
-        builder.addAddress(VPN_IPV4, 32)
-        builder.addDnsServer(VPN_DNS_IPV4)
-        builder.addRoute(VPN_DNS_IPV4, 32)
+            .setSession("DNS Changer")
+            .setMtu(MTU)
+            .addAddress(VPN_IPV4, 32)
+            .addDnsServer(VPN_DNS_IPV4)
+            .addRoute(VPN_DNS_IPV4, 32)
+            .setBlocking(true)
+        builder.setConfigureIntent(PendingIntent.getActivity(this, 4, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         try {
             builder.addAddress(VPN_IPV6, 128)
             builder.addDnsServer(VPN_DNS_IPV6)
             builder.addRoute(VPN_DNS_IPV6, 128)
-        } catch (_: Exception) {
-            Log.w(TAG, "IPv6 not available")
+        } catch (_: IllegalArgumentException) {
+            // IPv4 can still work on a device without IPv6 tunnel support.
         }
-        // Route the real upstream IPs and common resolvers so hardcoded queries
-        // are captured too.
-        collectResolverRoutes(builder)
-        // Never route our own traffic (prevents loops).
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: Exception) {
+        val routes = (config.upstreams.map { it.first } + EXTRA_RESOLVERS +
+            (properties?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList())).distinct()
+        for (ip in routes) {
+            try { builder.addRoute(ip, if (ip.contains(':')) 128 else 32) } catch (_: IllegalArgumentException) { }
         }
-        if (allowedPackages.isNotEmpty()) {
-            for (pkg in allowedPackages) {
+        applyAppScope(config.allowedPackages, packageName,
+            allow = { pkg ->
                 try {
                     builder.addAllowedApplication(pkg)
-                } catch (e: Exception) {
-                    Log.w(TAG, "addAllowedApplication($pkg) failed", e)
+                } catch (_: PackageManager.NameNotFoundException) {
+                    // Do not silently apply a focused connection to every app.
+                    throw VpnFailure("target_app_missing")
                 }
-            }
+            },
+            disallow = { builder.addDisallowedApplication(it) }
+        )
+        val fd = builder.establish() ?: throw VpnFailure("establish_failed")
+        val connection = try { Tunnel(fd, generation.incrementAndGet(), config) } catch (error: Exception) {
+            fd.close()
+            throw error
         }
-        builder.setBlocking(true)
-        try {
-            vpnInterface = builder.establish()
-        } catch (e: Exception) {
-            Log.e(TAG, "establish failed", e)
-            stopInternal()
-            return
+        tunnel = connection
+        connection.resolver = DnsResolver(config.upstreams, { protect(it) }) { pending, response ->
+            val packet = PacketUtils.buildUdpResponse(pending.dstAddr, pending.srcAddr, 53, pending.srcPort, response)
+            writeToTun(packet, connection.generation)
         }
-        if (vpnInterface == null) {
-            stopInternal()
-            return
-        }
-        output = FileOutputStream(vpnInterface!!.fileDescriptor)
-        startForeground(NOTIFICATION_ID, buildNotification())
-        running = true
-        lastTraffic.set(System.currentTimeMillis())
-        registerNetworkCallback()
-
-        resolver = DnsResolver(upstreams) { pending, response ->
-            onDnsResponse(pending, response)
-        }
-        resolver!!.start()
-
-        readerThread = Thread({
-            runReader(FileInputStream(vpnInterface!!.fileDescriptor))
-        }, "DnsVpnReader")
-        readerThread!!.start()
-
-        mainHandler.postDelayed({ watchdogTick() }, WATCHDOG_IDLE_MS)
+        connection.resolver!!.start()
+        connection.reader = Thread({ readTunnel(connection) }, "DnsVpnReader").also { it.start() }
+        watchNetwork(connection.generation, fingerprint)
+        // Returning means establish() succeeded and tunnel I/O is ready. Only
+        // now may VpnSession publish CONNECTED and Android display its VPN key.
     }
 
-    private fun collectResolverRoutes(builder: Builder) {
-        val seen = mutableSetOf<String>()
-        val addRoute = { ip: String ->
-            if (ip.isNotBlank() && seen.add(ip)) {
-                try {
-                    val prefix = if (ip.contains(":")) 128 else 32
-                    builder.addRoute(ip, prefix)
-                } catch (_: Exception) {
-                }
-            }
-        }
-        for (u in upstreams) addRoute(u.first)
-        EXTRA_V4_RESOLVERS.forEach(addRoute)
-        EXTRA_V6_RESOLVERS.forEach(addRoute)
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        try {
-            val network = cm.activeNetwork ?: return
-            val props: LinkProperties = cm.getLinkProperties(network) ?: return
-            for (dns in props.dnsServers) {
-                addRoute(dns.hostAddress ?: continue)
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun registerNetworkCallback() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
-        try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-            networkCallback = object : ConnectivityManager.NetworkCallback() {
-                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
-                    // Re-establish so newly added DNS routes are captured.
-                    if (running) {
-                        mainHandler.post { restartInterface() }
-                    }
-                }
-            }
-            cm.registerDefaultNetworkCallback(networkCallback!!)
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun watchdogTick() {
-        if (!running) return
-        if (System.currentTimeMillis() - lastTraffic.get() > WATCHDOG_IDLE_MS) {
-            Log.w(TAG, "Watchdog: re-establishing idle interface")
-            restartInterface()
-        } else {
-            mainHandler.postDelayed({ watchdogTick() }, WATCHDOG_IDLE_MS)
-        }
-    }
-
-    private fun restartInterface() {
-        val addrs = upstreams.map { "${it.first}:${it.second}" }
-        startInternal(addrs, currentPort, currentAllowedPackages)
-    }
-
-    private fun runReader(input: FileInputStream) {
+    private fun readTunnel(connection: Tunnel) {
         val packet = ByteArray(32767)
-        while (running && !Thread.interrupted()) {
-            val len = try {
-                input.read(packet)
-            } catch (_: Exception) {
-                break
-            }
-            if (len <= 0) continue
-            lastTraffic.set(System.currentTimeMillis())
-            val parsed = PacketUtils.parse(packet, len) ?: continue
-            if (parsed.dstPort != 53) continue
-            when (parsed.protocol) {
-                PacketUtils.PROTO_UDP -> {
-                    val payload = packet.copyOfRange(parsed.transportOffset + 8, len)
-                    if (payload.size >= 12) {
-                        resolver?.resolve(payload, parsed.srcAddr, parsed.srcPort, parsed.dstAddr)
+        try {
+            while (isCurrent(connection.generation) && !Thread.currentThread().isInterrupted) {
+                val length = connection.input.read(packet)
+                if (length < 0) break
+                if (length == 0 || !isCurrent(connection.generation)) continue
+                val parsed = PacketUtils.parse(packet, length) ?: continue
+                if (parsed.dstPort != 53) continue
+                when (parsed.protocol) {
+                    PacketUtils.PROTO_UDP -> {
+                        val offset = parsed.transportOffset + 8
+                        if (length < offset + 12) continue
+                        connection.resolver?.resolve(packet.copyOfRange(offset, length), parsed.srcAddr, parsed.srcPort, parsed.dstAddr)
+                    }
+                    PacketUtils.PROTO_TCP -> {
+                        val key = "${parsed.srcAddr.joinToString(":")}|${parsed.srcPort}|${parsed.dstAddr.joinToString(":")}"
+                        val proxy = connection.tcp.getOrPut(key) {
+                            TcpProxy(parsed.srcAddr, parsed.srcPort, parsed.dstAddr, connection.config.upstreams,
+                                { protect(it) },
+                                { writeToTun(it, connection.generation) },
+                                { closed -> connection.tcp.remove(key, closed); closed.close() })
+                        }
+                        if (!isCurrent(connection.generation)) {
+                            connection.tcp.remove(key, proxy)
+                            proxy.close()
+                            continue
+                        }
+                        proxy.feed(packet, parsed.transportOffset, length, parsed.tcpFlags)
                     }
                 }
-                PacketUtils.PROTO_TCP -> {
-                    val key = parsed.srcPort
-                    val proxy = tcpProxies.getOrPut(key) {
-                        TcpProxy(
-                            parsed.srcAddr, parsed.srcPort, parsed.dstAddr, upstreams,
-                            { bytes -> writeToTun(bytes) },
-                            { p ->
-                                tcpProxies.remove(key)
-                                p.close()
-                            }
-                        )
-                    }
-                    proxy.feed(packet, parsed.transportOffset, len, parsed.tcpFlags)
-                }
             }
+        } catch (_: Exception) {
+            // Do not log addresses from socket/IO exceptions.
+        } finally {
+            tunnelFailed(connection.generation)
         }
     }
 
-    private fun onDnsResponse(pending: DnsResolver.PendingQuery, response: ByteArray) {
-        val pkt = PacketUtils.buildUdpResponse(pending.dstAddr, pending.srcAddr, 53, pending.srcPort, response)
-        writeToTun(pkt)
-    }
-
-    private fun writeToTun(bytes: ByteArray) {
-        val out = output ?: return
-        synchronized(out) {
+    private fun writeToTun(bytes: ByteArray, token: Long) {
+        val connection = tunnel ?: return
+        if (connection.generation != token) return
+        synchronized(connection.output) {
+            if (!isCurrent(token)) return
             try {
-                out.write(bytes)
-                out.flush()
+                connection.output.write(bytes)
+                connection.output.flush()
             } catch (_: Exception) {
+                tunnelFailed(token)
             }
         }
     }
 
-    private fun stopInternal() {
-        running = false
-        currentUpstreams = emptyList()
-        try {
-            networkCallback?.let {
-                (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-                    ?.unregisterNetworkCallback(it)
-            }
-        } catch (_: Exception) {
+    private fun tunnelFailed(token: Long) {
+        mainHandler.post {
+            // A closed reader from an earlier pause/reconnect must never stop
+            // the replacement tunnel or erase its notification.
+            if (isCurrent(token)) session.stop("tunnel_closed")
         }
+    }
+
+    private fun isCurrent(token: Long): Boolean = tunnel?.generation == token && generation.get() == token
+
+    private fun releaseTunnel() {
+        mainHandler.removeCallbacks(reconnect)
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        networkCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: Exception) { } }
         networkCallback = null
-        resolver?.stop()
-        resolver = null
-        tcpProxies.values.forEach { it.close() }
-        tcpProxies.clear()
-        try {
-            output?.close()
-        } catch (_: Exception) {
+        networkTracker.reset(null)
+        generation.incrementAndGet()
+        val old = tunnel
+        tunnel = null
+        if (old != null) {
+            old.resolver?.stop()
+            old.tcp.values.forEach { it.close() }
+            old.tcp.clear()
+            old.reader?.interrupt()
+            try { old.input.close() } catch (_: Exception) { }
+            try { old.output.close() } catch (_: Exception) { }
+            try { old.fd.close() } catch (_: Exception) { }
         }
-        output = null
-        try {
-            vpnInterface?.close()
-        } catch (_: Exception) {
+        // Deliberately no stopSelf()/stopForeground() here. Pause and reconnect
+        // reuse this service; only final shutdown removes its notification.
+    }
+
+    private fun fingerprint(network: Network, properties: LinkProperties): String? {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val capabilities = cm.getNetworkCapabilities(network) ?: return null
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return null
+        return "${network.networkHandle}|${properties.interfaceName}|" +
+            properties.dnsServers.mapNotNull { it.hostAddress }.sorted().joinToString(",") + "|" +
+            properties.linkAddresses.map { it.toString() }.sorted().joinToString(",")
+    }
+
+    private fun watchNetwork(token: Long, initialFingerprint: String?) {
+        networkTracker.reset(initialFingerprint)
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                val current = fingerprint(network, linkProperties) ?: return
+                mainHandler.post {
+                    if (!isCurrent(token) || session.phase != VpnPhase.CONNECTED ||
+                        VpnRuntime.snapshot.phase != VpnPhase.CONNECTED) return@post
+                    if (networkTracker.changed(current)) {
+                        mainHandler.removeCallbacks(reconnect)
+                        mainHandler.postDelayed(reconnect, 750)
+                    }
+                }
+            }
         }
-        vpnInterface = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        } catch (_: Exception) {
+            // Optional network monitoring must not tear down a healthy TUN.
+        }
+    }
+
+    private fun showForeground(phase: VpnPhase) {
+        if (foreground) {
+            showNotification(phase)
+            return
+        }
+        try {
+            val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+            ServiceCompat.startForeground(this, VpnNotifications.ID, VpnNotifications.build(this, phase), type)
+            foreground = true
+        } catch (_: Exception) {
+            throw VpnFailure("foreground_failed")
+        }
+    }
+
+    private fun showNotification(phase: VpnPhase, errorCode: String? = null) {
+        // FGS is allowed without POST_NOTIFICATIONS, but Android may hide the
+        // drawer entry. The UI detects that and offers notification settings.
+        if (!VpnNotifications.enabled(this)) return
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(VpnNotifications.ID, VpnNotifications.build(this, phase, errorCode))
+        } catch (_: SecurityException) { }
+    }
+
+    private fun removeNotification() {
+        if (foreground) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foreground = false
+        }
+        getSystemService(NotificationManager::class.java).cancel(VpnNotifications.ID)
+    }
+
+    override fun onRevoke() {
+        // VpnService may invoke this on a Binder thread. Serialize cleanup with
+        // start/pause/resume; session.stop already calls the default stopSelf.
+        mainHandler.post {
+            VpnRuntime.cancelQueuedStarts()
+            session.stop("permission_revoked")
+        }
     }
 
     override fun onDestroy() {
-        stopInternal()
+        session.destroy()
+        VpnRuntime.serviceAlive = false
+        if (VpnRuntime.snapshot.phase == VpnPhase.STOPPING) VpnRuntime.publish(VpnPhase.DISCONNECTED)
+        mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
-    }
-
-    private fun buildNotification(): Notification {
-        createChannel()
-        val contentIntent = PendingIntent.getActivity(
-            this, 0,
-            packageManager.getLaunchIntentForPackage(packageName),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 1,
-            Intent(this, DnsVpnService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, CHANNEL_ID)
-        } else {
-            Notification.Builder(this)
-        }
-        return builder
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentTitle("DNS Changer active")
-            .setContentText("DNS: " + currentUpstreams.joinToString(", "))
-            .setContentIntent(contentIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopIntent)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "DNS Changer VPN", NotificationManager.IMPORTANCE_LOW
-            )
-            channel.description = "Shown while the secure DNS tunnel is running"
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    private fun parseHostPort(host: String, defaultPort: Int): Pair<String, Int>? {
-        val trimmed = host.trim()
-        if (trimmed.isEmpty()) return null
-        return try {
-            if (trimmed.startsWith("[")) {
-                val end = trimmed.indexOf(']')
-                val h = trimmed.substring(1, end)
-                val p = trimmed.substring(end + 1).removePrefix(":").toIntOrNull() ?: defaultPort
-                h to p
-            } else if (trimmed.count { it == ':' } == 1 && trimmed.substringAfter(':').toIntOrNull() != null) {
-                val parts = trimmed.split(':')
-                parts[0] to parts[1].toInt()
-            } else if (trimmed.contains(':')) {
-                trimmed to defaultPort
-            } else {
-                trimmed to defaultPort
-            }
-        } catch (_: Exception) {
-            null
-        }
     }
 }
