@@ -119,6 +119,12 @@ npx wrangler deploy
 
 آدرس پنل: `https://dns-changer-admin.xxx.workers.dev/admin`
 
+**ورود به پنل:** اگر `ADMIN_KEY` را ست کرده‌ای همان را وارد کن (یا `/admin?key=YOUR_ADMIN_KEY`).
+اگر هنوز هیچ کلیدی وجود ندارد، پنل خودش فرم **First boot — set admin key** را نشان می‌دهد و
+کلید را همان‌جا می‌سازی. اگر `Unauthorized` گرفتی یعنی کلید واردشده با Secret یکی نیست؛
+با `npx wrangler secret put ADMIN_KEY` کلید را دوباره ست کن (بدون نیاز به deploy مجدد) و
+با همان مقدار وارد شو. جزئیات بیشتر در بخش *Getting Unauthorized* فایل `cloudflare/README.md`.
+
 > راهنمای کامل‌تر: [`cloudflare/README.md`](cloudflare/README.md)
 
 ### لینک کردن برنامه به پنل

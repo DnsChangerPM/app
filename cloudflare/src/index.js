@@ -62,11 +62,31 @@ function adminKeyOf(cfg, request, url) {
   return (request.headers.get('x-admin-key') || url.searchParams.get('key') || '').trim();
 }
 
+// Constant-time string comparison so the admin key can't be brute-forced by timing.
+function safeEqual(a, b) {
+  const enc = new TextEncoder();
+  const x = enc.encode(String(a));
+  const y = enc.encode(String(b));
+  if (x.byteLength !== y.byteLength) return false;
+  if (crypto.subtle && typeof crypto.subtle.timingSafeEqual === 'function') {
+    return crypto.subtle.timingSafeEqual(x, y);
+  }
+  let diff = 0;
+  for (let i = 0; i < x.byteLength; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+// True when no admin key exists anywhere (neither the ADMIN_KEY secret nor KV config).
+// In that state the panel is in "first boot" mode and the first key that is set wins.
+function adminKeyConfigured(cfg, env) {
+  return Boolean((cfg.admin_key && String(cfg.admin_key).trim()) || (env.ADMIN_KEY && String(env.ADMIN_KEY).trim()));
+}
+
 function authorized(cfg, request, url, env) {
   const key = adminKeyOf(cfg, request, url);
   if (!key) return false;
-  if (cfg.admin_key && key === cfg.admin_key) return true;
-  if (env.ADMIN_KEY && key === env.ADMIN_KEY) return true;
+  if (cfg.admin_key && safeEqual(key, String(cfg.admin_key).trim())) return true;
+  if (env.ADMIN_KEY && safeEqual(key, String(env.ADMIN_KEY).trim())) return true;
   return false;
 }
 
@@ -256,19 +276,62 @@ async function getLatestRelease(env, cfg) {
 // ---------------------------------------------------------------------------
 async function handleAdmin(request, env, url, cors, path) {
   const cfg = await getConfig(env);
+  const configured = adminKeyConfigured(cfg, env);
+
+  // /api/admin/status — public, tells the panel whether an admin key exists yet.
+  // Never leaks the key itself; only a boolean.
+  if (path === '/api/admin/status' && request.method === 'GET') {
+    return json({ ok: true, data: { configured } }, cors);
+  }
+
+  // First boot: no admin key anywhere → allow setting it once via POST /api/admin/config.
+  // Only admin_key is accepted in this call; everything else still requires auth.
+  if (!configured) {
+    if (path === '/api/admin/config' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const newKey = typeof body.admin_key === 'string' ? body.admin_key.trim() : '';
+      if (newKey.length < 8) {
+        return json({ ok: false, message: 'Admin key must be at least 8 characters.' }, cors, 400);
+      }
+      // Re-read config right before writing to shrink the race window on first boot.
+      const fresh = await getConfig(env);
+      if (adminKeyConfigured(fresh, env)) {
+        return json({ ok: false, message: 'Admin key was already set. Log in with it.' }, cors, 409);
+      }
+      fresh.admin_key = newKey;
+      await setConfig(env, fresh);
+      return json({ ok: true, message: 'Admin key set. You are now logged in.' }, cors);
+    }
+    return json({
+      ok: false,
+      code: 'not_configured',
+      message: 'No admin key is configured yet. Open /admin to set one, or run: wrangler secret put ADMIN_KEY',
+    }, cors, 401);
+  }
+
   if (!authorized(cfg, request, url, env)) {
-    return json({ ok: false, message: 'Unauthorized: missing or invalid admin key.' }, cors, 401);
+    return json({ ok: false, code: 'unauthorized', message: 'Unauthorized: missing or invalid admin key.' }, cors, 401);
   }
 
   // /api/admin/config
   if (path === '/api/admin/config') {
     if (request.method === 'GET') {
-      const masked = { ...cfg, github_token: cfg.github_token ? '***set***' : '' };
+      const masked = {
+        ...cfg,
+        github_token: cfg.github_token ? '***set***' : '',
+        // Never echo the real key back; the panel only needs to know whether one exists.
+        admin_key: adminKeyConfigured(cfg, env) ? '***set***' : '',
+      };
       return json({ ok: true, data: masked }, cors);
     }
     if (request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
-      if (typeof body.admin_key === 'string' && body.admin_key.trim()) cfg.admin_key = body.admin_key.trim();
+      if (typeof body.admin_key === 'string' && body.admin_key.trim()) {
+        if (body.admin_key.trim().length < 8) {
+          return json({ ok: false, message: 'Admin key must be at least 8 characters.' }, cors, 400);
+        }
+        cfg.admin_key = body.admin_key.trim();
+      }
       if (typeof body.min_version === 'string') cfg.min_version = body.min_version.trim();
       if (typeof body.github_repo === 'string' && body.github_repo.trim()) cfg.github_repo = body.github_repo.trim();
       if (typeof body.github_token === 'string') cfg.github_token = body.github_token.trim();
@@ -527,9 +590,21 @@ function adminHtml() {
   <div id="loginView">
     <div class="card" style="max-width:420px;margin:60px auto;">
       <h2>Admin login</h2>
-      <p class="muted">Enter the admin key. Set it on first deploy via the wrangler secret <code>ADMIN_KEY</code>.</p>
-      <input id="adminKey" type="password" placeholder="Admin key" style="width:100%;margin-bottom:10px;" />
-      <button style="width:100%" onclick="login()">Login</button>
+      <p class="muted">Enter the admin key (the <code>ADMIN_KEY</code> secret, or the key you set on first boot).</p>
+      <input id="adminKey" type="password" placeholder="Admin key" style="width:100%;margin-bottom:10px;" onkeydown="if(event.key==='Enter')login()" />
+      <button id="loginBtn" style="width:100%" onclick="login()">Login</button>
+      <p id="loginError" class="muted hidden" style="color:var(--red);margin-top:10px;"></p>
+    </div>
+  </div>
+
+  <div id="setupView" class="hidden">
+    <div class="card" style="max-width:420px;margin:60px auto;">
+      <h2>🚀 First boot — set admin key</h2>
+      <p class="muted">No admin key is configured yet (no <code>ADMIN_KEY</code> secret and nothing saved in KV). Choose a strong key now — it is required to open this panel from now on.</p>
+      <input id="setupKey" type="password" placeholder="New admin key (min 8 chars)" style="width:100%;margin-bottom:10px;" />
+      <input id="setupKey2" type="password" placeholder="Repeat admin key" style="width:100%;margin-bottom:10px;" onkeydown="if(event.key==='Enter')setupKey()" />
+      <button id="setupBtn" style="width:100%" onclick="setupKey()">Set admin key &amp; login</button>
+      <p id="setupError" class="muted hidden" style="color:var(--red);margin-top:10px;"></p>
     </div>
   </div>
 
@@ -593,7 +668,7 @@ function adminHtml() {
         <h3>How it works</h3>
         <ol style="line-height:1.8">
           <li>Deploy this Worker to Cloudflare (free plan) with the three KV namespaces.</li>
-          <li>Open this page with <code>?key=YOUR_ADMIN_KEY</code> or paste the key on login.</li>
+          <li>Set the admin key: <code>wrangler secret put ADMIN_KEY</code> (or, on first boot, the panel asks you to create one). Then open this page with <code>?key=YOUR_ADMIN_KEY</code> or paste the key on login.</li>
           <li>Create a license: set a plan, device limit, duration and the private DNS servers (IPs).</li>
           <li>Share the generated key with your users. They enter it in the app → the DNS is unlocked.</li>
           <li>The app never shows the real subscription DNS — only an "active" switch.</li>
@@ -624,15 +699,79 @@ function adminHtml() {
 let KEY = localStorage.getItem('admin_key') || '';
 let currentLicenseKey = '';
 
+// Support opening the panel as /admin?key=YOUR_ADMIN_KEY (then scrub it from the URL/history).
+(function pickKeyFromUrl() {
+  try {
+    const u = new URL(location.href);
+    const k = (u.searchParams.get('key') || '').trim();
+    if (k) {
+      KEY = k;
+      localStorage.setItem('admin_key', KEY);
+      u.searchParams.delete('key');
+      history.replaceState(null, '', u.pathname + (u.search || '') + u.hash);
+    }
+  } catch (_) {}
+})();
+
 async function api(path, opts = {}) {
   const res = await fetch('/api/admin' + path, {
     ...opts,
     headers: { 'Content-Type': 'application/json', 'x-admin-key': KEY, ...(opts.headers || {}) },
   });
-  if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
-  const data = await res.json();
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) {
+    logout(data.code === 'not_configured'
+      ? 'No admin key is configured on the server yet.'
+      : 'Unauthorized: wrong admin key.');
+    const err = new Error(data.message || 'Unauthorized');
+    err.code = data.code || 'unauthorized';
+    throw err;
+  }
   if (!data.ok && data.message) throw new Error(data.message);
   return data;
+}
+
+function show(id, on) { document.getElementById(id).classList.toggle('hidden', !on); }
+function setError(id, msg) {
+  const el = document.getElementById(id);
+  el.textContent = msg || '';
+  el.classList.toggle('hidden', !msg);
+}
+
+async function serverConfigured() {
+  try {
+    const res = await fetch('/api/admin/status', { cache: 'no-store' });
+    const data = await res.json();
+    return data && data.ok ? Boolean(data.data.configured) : true;
+  } catch (_) { return true; }
+}
+
+async function setupKey() {
+  const k1 = document.getElementById('setupKey').value.trim();
+  const k2 = document.getElementById('setupKey2').value.trim();
+  setError('setupError', '');
+  if (k1.length < 8) return setError('setupError', 'Admin key must be at least 8 characters.');
+  if (k1 !== k2) return setError('setupError', 'Keys do not match.');
+  const btn = document.getElementById('setupBtn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/admin/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ admin_key: k1 }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.message || ('HTTP ' + res.status));
+    KEY = k1;
+    localStorage.setItem('admin_key', KEY);
+    toast('Admin key set');
+    await boot();
+  } catch (e) {
+    setError('setupError', e.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function toast(msg) {
@@ -641,16 +780,38 @@ function toast(msg) {
   setTimeout(() => t.style.display = 'none', 2500);
 }
 
-function login() {
-  KEY = document.getElementById('adminKey').value.trim();
-  localStorage.setItem('admin_key', KEY);
-  boot();
+async function login() {
+  const key = document.getElementById('adminKey').value.trim();
+  setError('loginError', '');
+  if (!key) return setError('loginError', 'Enter the admin key.');
+  const btn = document.getElementById('loginBtn');
+  btn.disabled = true;
+  try {
+    // Verify the key against the server before entering the panel.
+    const res = await fetch('/api/admin/config', { headers: { 'x-admin-key': key }, cache: 'no-store' });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      throw new Error(data.code === 'not_configured'
+        ? 'No admin key is configured on the server yet. Reload this page to set one.'
+        : 'Wrong admin key.');
+    }
+    if (!res.ok || !data.ok) throw new Error(data.message || ('Server error (HTTP ' + res.status + ')'));
+    KEY = key;
+    localStorage.setItem('admin_key', KEY);
+    await boot();
+  } catch (e) {
+    setError('loginError', e.message);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
-function logout() {
+function logout(reason) {
   KEY = ''; localStorage.removeItem('admin_key');
-  document.getElementById('appView').classList.add('hidden');
-  document.getElementById('loginView').classList.remove('hidden');
+  show('appView', false);
+  show('setupView', false);
+  show('loginView', true);
+  setError('loginError', reason || '');
 }
 
 function showTab(name) {
@@ -663,10 +824,19 @@ function showTab(name) {
 }
 
 async function boot() {
-  if (!KEY) { document.getElementById('appView').classList.add('hidden'); return; }
-  document.getElementById('loginView').classList.add('hidden');
-  document.getElementById('appView').classList.remove('hidden');
-  try { await loadLicenses(); await loadConfig(); } catch (e) { toast(e.message); }
+  show('appView', false);
+  const configured = await serverConfigured();
+  if (!configured) {
+    // First boot: no ADMIN_KEY secret and nothing in KV → show the setup form.
+    show('loginView', false);
+    show('setupView', true);
+    return;
+  }
+  show('setupView', false);
+  if (!KEY) { show('loginView', true); return; }
+  show('loginView', false);
+  show('appView', true);
+  try { await loadLicenses(); await loadConfig(); } catch (e) { if (e.code !== 'unauthorized' && e.code !== 'not_configured') toast(e.message); }
 }
 
 function fmtDate(ts) {
