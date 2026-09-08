@@ -60,6 +60,7 @@ android {
                 storePassword keystoreProperties['storePassword']
                 keyAlias keystoreProperties['keyAlias']
                 keyPassword keystoreProperties['keyPassword']
+                storeType keystoreProperties['storeType'] ?: "PKCS12"
             }
         }
     }
