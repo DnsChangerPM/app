@@ -168,8 +168,9 @@ class _UpdateGateState extends State<UpdateGate> {
     try {
       await _updater.exitApp();
     } catch (_) {
-      if (mounted)
+      if (mounted) {
         setState(() => _error = const UpdateException('exit_failed').message);
+      }
     } finally {
       if (mounted) setState(() => _exiting = false);
     }
