@@ -34,8 +34,24 @@ You will get a URL like `https://dns-changer-admin.YOUR_SUBDOMAIN.workers.dev`.
 
 ## 2. First login
 
-Open `https://...workers.dev/admin`. If you set `ADMIN_KEY` secret, use it to log in.
-Otherwise you can set the admin key from the **Settings** tab (first boot allows setting it via the API).
+Open `https://...workers.dev/admin`.
+
+- If you set the `ADMIN_KEY` secret, paste it on the login screen (or open `/admin?key=YOUR_ADMIN_KEY`).
+- If **no** key exists yet (no secret and nothing in KV), the panel shows a **"First boot — set admin key"**
+  form. Choose a key (min 8 chars) — it is saved to KV and you are logged in immediately.
+  From then on that key is required; the setup form never appears again.
+
+### Getting `Unauthorized` on login?
+
+| Cause | Fix |
+| --- | --- |
+| Key typed differently from the secret (typo, extra characters) | `npx wrangler secret put ADMIN_KEY` again with the key you want, then log in with exactly that value. |
+| Secret was set on a **different** Worker than the one you opened (e.g. `black-snow-...` vs `dns-changer-admin`) | Check `name` in `wrangler.toml`; run `npx wrangler secret list` in the same folder to see which Worker has the secret. |
+| Worker deployed before you added the secret and you're not sure what it is | Set a new one: `npx wrangler secret put ADMIN_KEY` (secrets take effect immediately, no redeploy needed). |
+| A key was set in KV on first boot and you forgot it | Either set the `ADMIN_KEY` secret (it works in addition to the KV key), or delete the `config` key from the `CONFIG_KV` namespace in the Cloudflare dashboard to return to first-boot mode. |
+| Browser has an old wrong key cached | Click **Logout** (clears `localStorage`) and log in again. |
+
+To change the key later, use **Settings → Admin key** in the panel, or rotate the `ADMIN_KEY` secret.
 
 ## 3. Create a license
 
@@ -71,7 +87,8 @@ APK download** button (it never opens GitHub).
 | --- | --- | --- | --- |
 | POST | `/api/client/license` | none | `{action:"activate"|"check", license_key, device_id, device_name}` |
 | GET | `/api/client/release?version=X` | none | latest release + killed versions + min version |
-| GET/POST | `/api/admin/config` | `x-admin-key` | read/update settings |
+| GET | `/api/admin/status` | none | `{configured: bool}` — whether an admin key exists yet |
+| GET/POST | `/api/admin/config` | `x-admin-key` | read/update settings (POST `{admin_key}` is allowed **without** auth only while no key exists — first boot) |
 | GET/POST | `/api/admin/licenses` | `x-admin-key` | list / create / update / delete / revoke licenses |
 | GET | `/api/admin/license/:key` | `x-admin-key` | license + devices |
 | DELETE | `/api/admin/license/:key/devices/:id` | `x-admin-key` | remove a device |
