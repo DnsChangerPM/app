@@ -42,6 +42,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<DnsServer> servers = List.of(freeDnsServers);
   LicenseInfo? licenseInfo;
 
+  /// How often the app re-validates an active subscription while running, so a
+  /// license/device ban from the panel takes effect within a minute instead of
+  /// letting the user keep the private DNS for hours.
+  static const Duration _licenseHeartbeatInterval = Duration(seconds: 45);
+  Timer? _licenseHeartbeat;
+  bool _licenseBusy = false;
+
   @override
   void initState() {
     super.initState();
@@ -79,7 +86,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) unawaited(_syncVpnStatus());
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_syncVpnStatus());
+      // Coming back to the app is a good moment to re-validate the license so
+      // a ban that happened while the app was in the background takes effect.
+      if (licenseInfo?.isActive ?? false) unawaited(_refreshLicense());
+    }
   }
 
   Future<void> _loadLocalState() async {
@@ -114,18 +126,46 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       servers = nextServers;
       _loading = false;
     });
+    _syncLicenseHeartbeat();
     await prefs.setString('selected_server', selectedId);
+  }
+
+  /// Starts/stops the periodic subscription re-validation. Runs only while a
+  /// license is cached and active, so a panel-side ban kicks in quickly.
+  void _syncLicenseHeartbeat() {
+    final shouldRun = _license.licenseKey != null &&
+        _license.cachedInfo?.isActive == true &&
+        mounted;
+    if (shouldRun && _licenseHeartbeat == null) {
+      _licenseHeartbeat = Timer.periodic(
+        _licenseHeartbeatInterval,
+        (_) => unawaited(_refreshLicense()),
+      );
+    } else if (!shouldRun && _licenseHeartbeat != null) {
+      _licenseHeartbeat!.cancel();
+      _licenseHeartbeat = null;
+    }
   }
 
   List<DnsServer> _buildServerList(List<DnsServer> custom, LicenseInfo? info) {
     final list = <DnsServer>[...custom, ...freeDnsServers];
     if (info != null && info.isActive) {
-      for (var i = 0; i < info.dnsServers.length; i++) {
+      // A license's DNS IPs are ONE subscription profile: primary + secondary
+      // together (like the built-in Cloudflare card with 1.1.1.1 + 1.0.0.1),
+      // not one separate server per IP.
+      final addresses = <String>[];
+      for (final raw in info.dnsServers) {
+        final address = raw.trim();
+        if (address.isNotEmpty && !addresses.contains(address)) {
+          addresses.add(address);
+        }
+      }
+      if (addresses.isNotEmpty) {
         list.add(DnsServer(
-          id: 'license_$i',
+          id: 'license_0',
           name: 'Subscription DNS',
           description: 'Private subscription server',
-          addresses: [info.dnsServers[i]],
+          addresses: addresses,
           isPremium: true,
         ));
       }
@@ -134,8 +174,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshLicense() async {
-    await _license.check();
-    if (mounted) await _loadLocalState();
+    if (_licenseBusy) return;
+    _licenseBusy = true;
+    try {
+      // Always identify the device so a per-device ban is answered on check()
+      // too, not only during the first activation.
+      await _license.check(deviceId: await _license.ensureDeviceId());
+      if (mounted) await _loadLocalState();
+    } finally {
+      _licenseBusy = false;
+    }
   }
 
   DnsServer? get _selectedServer {
@@ -188,9 +236,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await _runCommand(_vpn.resume);
     } else {
       final server = _selectedServer;
-      if (server == null ||
-          (server.isPremium && !(licenseInfo?.isActive ?? false))) {
-        return;
+      if (server == null) return;
+      if (server.isPremium && !(licenseInfo?.isActive ?? false)) return;
+      if (server.isPremium) {
+        // Re-validate before handing out private DNS, so a license/device ban
+        // made in the panel locks the subscription immediately.
+        setState(() => _commandPending = true);
+        LicenseInfo fresh;
+        try {
+          fresh =
+              await _license.check(deviceId: await _license.ensureDeviceId());
+        } finally {
+          if (mounted) setState(() => _commandPending = false);
+        }
+        if (!mounted) return;
+        if (!fresh.isActive) {
+          final message = fresh.message;
+          if (message != null && message.isNotEmpty) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text(message)));
+          }
+          await _loadLocalState();
+          return;
+        }
       }
       await _runCommand(() => _vpn.start(server.addresses,
           allowedPackages: focusGame ? [targetPackage] : <String>[]));
@@ -230,6 +298,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _licenseHeartbeat?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _statusSubscription?.cancel();
     super.dispose();

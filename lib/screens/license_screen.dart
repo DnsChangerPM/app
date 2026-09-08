@@ -1,7 +1,4 @@
-import 'dart:math';
-
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/license_info.dart';
 import '../services/license_service.dart';
@@ -31,6 +28,39 @@ class _LicenseScreenState extends State<LicenseScreen> {
           lastError!.status == 'server_error' ||
           lastError!.status == 'unreachable');
 
+  /// An explicit access block (license banned/revoked/expired, this device
+  /// banned, or the device limit reached). Rendered as a clear card instead of
+  /// a one-off snackbar so the user understands why access stopped.
+  LicenseInfo? get _blockedInfo {
+    final candidate = lastError ?? info;
+    if (candidate == null || candidate.isActive) return null;
+    const blocked = {
+      'banned',
+      'revoked',
+      'expired',
+      'device_banned',
+      'limit_reached',
+    };
+    return blocked.contains(candidate.status) ? candidate : null;
+  }
+
+  String _blockedTitle(String status) {
+    switch (status) {
+      case 'banned':
+        return 'لایسنس بن شده است';
+      case 'revoked':
+        return 'لایسنس لغو شده است';
+      case 'expired':
+        return 'لایسنس منقضی شده است';
+      case 'device_banned':
+        return 'این دستگاه از لایسنس بن شده است';
+      case 'limit_reached':
+        return 'سقف تعداد دستگاه‌ها پر است';
+      default:
+        return 'دسترسی غیرفعال است';
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -46,19 +76,6 @@ class _LicenseScreenState extends State<LicenseScreen> {
     });
   }
 
-  Future<String> _deviceId() async {
-    final prefs = await SharedPreferences.getInstance();
-    var id = prefs.getString('device_id');
-    if (id == null) {
-      final rand = Random.secure();
-      id = List.generate(
-              16, (_) => rand.nextInt(256).toRadixString(16).padLeft(2, '0'))
-          .join();
-      await prefs.setString('device_id', id);
-    }
-    return id;
-  }
-
   Future<void> _activate() async {
     final key = _keyController.text.trim();
     if (key.isEmpty) {
@@ -70,7 +87,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
       await _service.setLicenseKey(key);
       final result = await _service.validate(
         deviceName: 'Android',
-        deviceId: await _deviceId(),
+        deviceId: await _service.ensureDeviceId(),
       );
       if (!mounted) return;
       setState(() {
@@ -205,6 +222,9 @@ class _LicenseScreenState extends State<LicenseScreen> {
           ] else if (_serverRelatedFailure) ...[
             const SizedBox(height: 16),
             _serverHelpCard(),
+          ] else if (_blockedInfo != null) ...[
+            const SizedBox(height: 16),
+            _blockedCard(_blockedInfo!),
           ],
           const SizedBox(height: 24),
           const Text(
@@ -266,6 +286,55 @@ class _LicenseScreenState extends State<LicenseScreen> {
             Text(
               serverCheckResult!,
               style: const TextStyle(color: Colors.white70, height: 1.5),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _blockedCard(LicenseInfo blocked) {
+    final color = blocked.status == 'expired'
+        ? const Color(0xFFFFC107)
+        : blocked.status == 'limit_reached'
+            ? const Color(0xFF3AA6FF)
+            : const Color(0xFFFF5C5C);
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A1620),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.block, color: color),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  _blockedTitle(blocked.status),
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          if ((blocked.message ?? '').isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              blocked.message!,
+              style: const TextStyle(color: Colors.white70, height: 1.5),
+            ),
+          ],
+          if (blocked.status == 'device_banned' ||
+              blocked.status == 'banned' ||
+              blocked.status == 'revoked') ...[
+            const SizedBox(height: 8),
+            const Text(
+              'اگر فکر می‌کنید اشتباه شده، با پشتیبانی/فروشنده تماس بگیرید.',
+              style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.5),
             ),
           ],
         ],

@@ -29,11 +29,16 @@ class LicenseInfo {
   factory LicenseInfo.fromJson(Map<String, dynamic> json) {
     final data = (json['data'] as Map<String, dynamic>?) ?? json;
     final expiresRaw = data['expires_at'];
+    // The top-level envelope status is authoritative: the Worker answers
+    // `{ok:false, status:…}` with a nested data object whose own `status` is
+    // only the license state. Relying on the nested value would misread
+    // `limit_reached`, `device_banned`, … as plain "active".
+    final status = (json['status'] as String?) ??
+        (data['status'] as String?) ??
+        'unknown';
     return LicenseInfo(
-      valid: json['ok'] == true || data['valid'] == true,
-      status: (data['status'] as String?) ??
-          (json['status'] as String?) ??
-          'unknown',
+      valid: status == 'active' && (json['ok'] == true || data['valid'] == true),
+      status: status,
       licenseKey: data['license_key'] as String?,
       planName: data['plan_name'] as String?,
       deviceLimit: data['device_limit'] as int?,
