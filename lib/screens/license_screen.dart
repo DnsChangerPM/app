@@ -19,6 +19,17 @@ class _LicenseScreenState extends State<LicenseScreen> {
 
   bool loading = false;
   LicenseInfo? info;
+  LicenseInfo? lastError;
+  bool checkingServer = false;
+  String? serverCheckResult;
+
+  /// True when the last activation failed for a server-side reason
+  /// (missing/old endpoint or unreachable host) rather than a bad key.
+  bool get _serverRelatedFailure =>
+      lastError != null &&
+      (lastError!.status == 'server_not_found' ||
+          lastError!.status == 'server_error' ||
+          lastError!.status == 'unreachable');
 
   @override
   void initState() {
@@ -62,7 +73,13 @@ class _LicenseScreenState extends State<LicenseScreen> {
         deviceId: await _deviceId(),
       );
       if (!mounted) return;
-      setState(() => info = result);
+      setState(() {
+        info = result;
+        lastError = result.isActive ? null : result;
+        if (!result.isActive && _serverRelatedFailure) {
+          serverCheckResult = null;
+        }
+      });
       _snack(result.message ??
           (result.isActive ? 'Activated!' : 'Activation failed'));
     } catch (_) {
@@ -73,11 +90,30 @@ class _LicenseScreenState extends State<LicenseScreen> {
     }
   }
 
+  Future<void> _checkServer() async {
+    setState(() {
+      checkingServer = true;
+      serverCheckResult = null;
+    });
+    final health = await _service.checkServerHealth();
+    if (!mounted) return;
+    setState(() {
+      checkingServer = false;
+      serverCheckResult = health.message;
+      // An explicit green health check means the endpoint is configured right,
+      // even if the previous activation failed for another reason.
+      if (health.ok) lastError = null;
+    });
+    _snack(health.ok ? 'Server appears to be online' : 'Server check failed');
+  }
+
   Future<void> _deactivate() async {
     await _service.clear();
     if (!mounted) return;
     setState(() {
       info = null;
+      lastError = null;
+      serverCheckResult = null;
       _keyController.clear();
     });
     _snack('License removed');
@@ -166,6 +202,9 @@ class _LicenseScreenState extends State<LicenseScreen> {
               label: const Text('Remove license',
                   style: TextStyle(color: Colors.redAccent)),
             ),
+          ] else if (_serverRelatedFailure) ...[
+            const SizedBox(height: 16),
+            _serverHelpCard(),
           ],
           const SizedBox(height: 24),
           const Text(
@@ -173,6 +212,62 @@ class _LicenseScreenState extends State<LicenseScreen> {
             'limit, contact your admin to remove an old device.',
             style: TextStyle(color: Colors.white38, fontSize: 12, height: 1.4),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _serverHelpCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A1620),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFFF5C5C).withOpacity(0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.cloud_off, color: Color(0xFFFF5C5C)),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'مشکل از سمت سرور است',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            lastError?.message ?? '',
+            style: const TextStyle(color: Colors.white70, height: 1.5),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFF3AA6FF),
+              side: const BorderSide(color: Color(0xFF3AA6FF)),
+            ),
+            onPressed: checkingServer ? null : _checkServer,
+            icon: checkingServer
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.network_check, size: 18),
+            label: const Text('بررسی وضعیت سرور'),
+          ),
+          if (serverCheckResult != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              serverCheckResult!,
+              style: const TextStyle(color: Colors.white70, height: 1.5),
+            ),
+          ],
         ],
       ),
     );

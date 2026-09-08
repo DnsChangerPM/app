@@ -85,6 +85,7 @@ APK download** button (it never opens GitHub).
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
+| GET | `/api/public/health` | none | `{ok:true, api:2, ...}` — CI and the app use it to detect a missing or outdated Worker |
 | POST | `/api/client/license` | none | `{action:"activate"|"check", license_key, device_id, device_name}` |
 | GET | `/api/client/release?version=X` | none | latest release + killed versions + min version |
 | GET | `/api/admin/status` | none | `{configured: bool}` — whether an admin key exists yet |
@@ -94,3 +95,22 @@ APK download** button (it never opens GitHub).
 | DELETE | `/api/admin/license/:key/devices/:id` | `x-admin-key` | remove a device |
 | GET | `/api/admin/stats` | `x-admin-key` | totals |
 | POST | `/api/admin/refresh_release` | `x-admin-key` | refresh cached GitHub release |
+
+### Error semantics (important for the Android app)
+
+- **Unknown license key** → HTTP **200** with `{ok:false, status:"not_found", ...}`.
+  HTTP 404 is reserved for *missing routes*, so a wrong key is never confused
+  with a missing/outdated server.
+- License keys are stored canonically (no dashes) and **both formats work**:
+  users may enter `ABCDEFGHIJKLMNOP` or `ABCD-EFGH-IJKL-MNOP`. Previous Worker
+  versions stored keys with dashes but looked them up without, so even a
+  correct key was reported as not found (and the old app showed
+  "Server error (404)"). This Worker migrates such legacy records
+  automatically on first access — just redeploy it.
+- `expired`, `revoked`, `banned`, `limit_reached` are also HTTP 200 with
+  `ok:false` and a human-readable `message`.
+- HTTP 4xx/5xx means a wrong URL, an outdated Worker or Cloudflare edge
+  errors — the app reports these as server problems and offers a health check.
+- After deploying, verify: `curl https://YOUR.workers.dev/api/public/health`
+  must return `"api":2`. The release workflow refuses to build an APK against
+  anything older.
