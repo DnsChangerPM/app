@@ -193,7 +193,8 @@ void main() {
       versionLoader: () async => '1.0.1',
       client: MockClient((request) async {
         requests++;
-        if (pending != null) await pending!.future;
+        final gate = pending;
+        if (gate != null) await gate.future;
         return http.Response('{}', 503);
       }),
     );
