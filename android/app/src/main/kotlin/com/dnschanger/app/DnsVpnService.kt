@@ -293,7 +293,7 @@ class DnsVpnService : VpnService() {
         } catch (_: Exception) {
         }
         vpnInterface = null
-        stopForeground(true)
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
