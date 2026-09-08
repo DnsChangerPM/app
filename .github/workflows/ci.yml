@@ -29,17 +29,7 @@ jobs:
         run: flutter pub get
 
       - name: Analyze
-        run: |
-          set +e
-          flutter analyze > analyze.log 2>&1
-          STATUS=$?
-          tail -n 200 analyze.log
-          # Mirror every line as a check annotation so the failure is visible
-          # even when the Actions log service is unavailable.
-          while IFS= read -r line; do
-            echo "::error::$line"
-          done < analyze.log
-          exit $STATUS
+        run: flutter analyze
 
       - name: Test
         run: flutter test

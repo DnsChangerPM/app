@@ -19,13 +19,6 @@ void main() {
     return service;
   }
 
-  Map<String, dynamic> activateBody() => {
-        'action': 'activate',
-        'license_key': 'TEST-1234',
-        'device_name': 'Android',
-        'device_id': 'device-1',
-      };
-
   test('activates a valid license and decodes base64 DNS servers', () async {
     final client = MockClient((request) async {
       expect(request.url.path, '/api/client/license');
