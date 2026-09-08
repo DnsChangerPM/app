@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -57,6 +58,21 @@ class LicenseService {
     _licenseKey = key.trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_keyLicense, _licenseKey!);
+  }
+
+  /// The stable installation id sent with every activation/check. Persisted so
+  /// a device ban from the admin panel keeps targeting this exact installation.
+  Future<String> ensureDeviceId() async {
+    final prefs = await SharedPreferences.getInstance();
+    var id = prefs.getString('device_id');
+    if (id == null || id.isEmpty) {
+      final rand = Random.secure();
+      id = List.generate(
+              16, (_) => rand.nextInt(256).toRadixString(16).padLeft(2, '0'))
+          .join();
+      await prefs.setString('device_id', id);
+    }
+    return id;
   }
 
   Future<void> clear() async {
