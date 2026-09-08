@@ -55,16 +55,36 @@ To change the key later, use **Settings → Admin key** in the panel, or rotate 
 
 ## 3. Create a license
 
-1. Licenses tab → fill **plan name**, **device limit**, **duration (days)** and the **private DNS servers** (IPs, comma separated, e.g. `1.1.1.1, 1.0.0.1`).
-2. Click **Generate license key** → copy the key and send it to your user.
+1. Licenses tab → fill **plan name**, **device limit**, **duration (days)** and the **private DNS IPs**.
+2. All comma-separated IPs belong to **one** subscription DNS profile — primary + secondary
+   together (e.g. `1.1.1.1, 1.0.0.1`), exactly like the built-in Cloudflare server in the app.
+   They show up as a single "Subscription DNS" server. For a second private server, create
+   another license.
+3. Click **Generate license key** → copy the key and send it to your user.
 
 The app shows the subscription DNS only as a locked "active" option — the real
 addresses are base64-encoded in the API response and never displayed in the UI.
 
-## 4. Device management
+## 4. Device management and bans
 
 Click **Devices** on any license to see every device bound to it (name, id,
-first/last seen, IP) and remove devices to free up slots.
+first/last seen, IP, banned badge). Per device you can:
+
+- **Ban** — blocks that device permanently. Bans are written as tombstones that survive even
+  if the device entry is removed, and the app re-checks while running, so the banned device
+  loses access quickly and cannot re-register with the same installation id. Banned devices
+  keep occupying a license slot until you **Un-ban** them (then optionally remove them).
+- **Un-ban** — removes the permanent ban; the device may connect again if the license allows.
+- **Remove** — only removes the device's registration (frees a slot). It does **not** un-ban
+  a banned device — use Un-ban first if you want to let it back in.
+
+License-wide controls (top-right of each license row):
+
+- **Ban** (on active licenses) — instantly revokes the whole license for every device.
+- **Un-ban** (on banned/revoked licenses) — reactivates it.
+
+The client is refused with `status: banned/revoked/expired` or `device_banned`;
+error responses never include the private DNS addresses.
 
 ## 5. Force updates when you publish a new release
 

@@ -35,6 +35,12 @@ function json(data, cors, status = 200, extra = {}) {
   });
 }
 
+// Error payloads must never leak the private subscription DNS addresses, so
+// every non-active answer is sent without dns_servers_b64.
+function errDataOf(data, status, extra = {}) {
+  return { ...data, status, valid: false, dns_servers_b64: [], ...extra };
+}
+
 function text(data, type, status = 200) {
   return new Response(data, { status, headers: { 'content-type': type } });
 }
@@ -138,15 +144,139 @@ async function listDevices(env, key) {
   const norm = normKey(key);
   const legacyPrefix = 'device:' + keyWithDashes(norm) + ':';
   const names = await collectDeviceKeys(env, norm, legacyPrefix);
-  const out = [];
+  const byId = new Map();
   for (const name of names) {
     const raw = await env.DEVICES_KV.get(name);
     if (raw) {
-      try { out.push(JSON.parse(raw)); } catch (_) {}
+      try {
+        const device = JSON.parse(raw);
+        byId.set(device.id, device);
+      } catch (_) {}
     }
   }
+  // Permanent bans live in their own tombstone records (`ban:<KEY>:<ID>`) so a
+  // banned device stays blocked even after its normal device record is removed.
+  const banNames = await collectBanKeys(env, norm, 'ban:' + keyWithDashes(norm) + ':');
+  for (const name of banNames) {
+    const id = name.slice(('ban:' + norm + ':').length);
+    const raw = await env.DEVICES_KV.get(name);
+    let ban = null;
+    if (raw) {
+      try { ban = JSON.parse(raw); } catch (_) {}
+    }
+    const existing = byId.get(id);
+    if (existing) {
+      existing.banned = true;
+      existing.banned_at = (ban && ban.banned_at) || existing.banned_at || null;
+      if (!existing.name && ban && ban.name) existing.name = ban.name;
+      byId.set(id, existing);
+    } else {
+      byId.set(id, {
+        id,
+        name: (ban && ban.name) || 'Banned device',
+        ip: (ban && ban.ip) || '',
+        first_seen: (ban && ban.first_seen) || 0,
+        last_seen: (ban && ban.last_seen) || (ban && ban.banned_at) || 0,
+        banned: true,
+        banned_at: (ban && ban.banned_at) || 0,
+      });
+    }
+  }
+  const out = [...byId.values()];
   out.sort((a, b) => (b.last_seen || 0) - (a.last_seen || 0));
   return out;
+}
+
+// Returns canonical `ban:<NORM>:<id>` tombstone names (bans are always written
+// in canonical form, so only legacy-dashed keys would ever need migrating).
+async function collectBanKeys(env, norm, legacyPrefix) {
+  const prefix = 'ban:' + norm + ':';
+  const lists = await Promise.all([
+    env.DEVICES_KV.list({ prefix }),
+    legacyPrefix && legacyPrefix !== prefix
+      ? env.DEVICES_KV.list({ prefix: legacyPrefix })
+      : Promise.resolve({ keys: [] }),
+  ]);
+  const seen = new Set();
+  const names = [];
+  for (const item of lists[0].keys) {
+    seen.add(item.name);
+    names.push(item.name);
+  }
+  for (const item of lists[1].keys) {
+    const id = item.name.slice(legacyPrefix.length);
+    const canonical = prefix + id;
+    if (seen.has(canonical)) {
+      await env.DEVICES_KV.delete(item.name);
+      continue;
+    }
+    const raw = await env.DEVICES_KV.get(item.name);
+    if (raw) {
+      await env.DEVICES_KV.put(canonical, raw);
+      await env.DEVICES_KV.delete(item.name);
+    }
+    seen.add(canonical);
+    names.push(canonical);
+  }
+  return names;
+}
+
+// True when the device id carries a permanent ban for this license (checks the
+// tombstone OR the live device record, whichever exists).
+async function isDeviceBanned(env, key, deviceId) {
+  const norm = normKey(key);
+  const tomb = await env.DEVICES_KV.get('ban:' + norm + ':' + deviceId);
+  if (tomb) return true;
+  const recordRaw = await env.DEVICES_KV.get('device:' + norm + ':' + deviceId);
+  if (recordRaw) {
+    try { return JSON.parse(recordRaw).banned === true; } catch (_) {}
+  }
+  return false;
+}
+
+// Permanent device ban: writes a tombstone that survives device removal, and
+// flags the live record (if any) so the Devices list shows the badge. The
+// device keeps occupying one of the license slots until it is unbanned and
+// removed — a banned user can never silently free their own slot.
+async function banDevice(env, key, deviceId, meta) {
+  const norm = normKey(key);
+  const recordKey = 'device:' + norm + ':' + deviceId;
+  const recordRaw = await env.DEVICES_KV.get(recordKey);
+  let record = null;
+  if (recordRaw) {
+    try { record = JSON.parse(recordRaw); } catch (_) {}
+  }
+  const now = Date.now();
+  const tomb = {
+    id: deviceId,
+    name: (meta && meta.name) || (record && record.name) || 'Banned device',
+    ip: (meta && meta.ip) || (record && record.ip) || '',
+    first_seen: (record && record.first_seen) || now,
+    last_seen: (record && record.last_seen) || now,
+    banned: true,
+    banned_at: now,
+  };
+  await env.DEVICES_KV.put('ban:' + norm + ':' + deviceId, JSON.stringify(tomb));
+  if (record) {
+    record.banned = true;
+    record.banned_at = now;
+    await env.DEVICES_KV.put(recordKey, JSON.stringify(record));
+  }
+  return tomb;
+}
+
+async function unbanDevice(env, key, deviceId) {
+  const norm = normKey(key);
+  await env.DEVICES_KV.delete('ban:' + norm + ':' + deviceId);
+  const recordRaw = await env.DEVICES_KV.get('device:' + norm + ':' + deviceId);
+  if (recordRaw) {
+    try {
+      const record = JSON.parse(recordRaw);
+      delete record.banned;
+      delete record.banned_at;
+      await env.DEVICES_KV.put('device:' + norm + ':' + deviceId, JSON.stringify(record));
+    } catch (_) {}
+  }
 }
 
 // Returns canonical `device:<NORM>:<id>` names, migrating legacy dashed keys
@@ -184,6 +314,10 @@ async function collectDeviceKeys(env, norm, legacyPrefix) {
   return names;
 }
 
+// Removes a device's registration record only. A permanent ban tombstone is
+// deliberately left alone — a banned device must stay blocked until the admin
+// explicitly unbans it (otherwise "Remove" would silently unban the device and
+// let it register again on its next activation).
 async function deleteDevice(env, key, deviceId) {
   const norm = normKey(key);
   await env.DEVICES_KV.delete('device:' + norm + ':' + deviceId);
@@ -196,6 +330,8 @@ async function deleteLicenseData(env, key) {
   await env.LICENSES_KV.delete('license:' + keyWithDashes(norm));
   const names = await collectDeviceKeys(env, norm, 'device:' + keyWithDashes(norm) + ':');
   for (const name of names) await env.DEVICES_KV.delete(name);
+  const bans = await collectBanKeys(env, norm, 'ban:' + keyWithDashes(norm) + ':');
+  for (const name of bans) await env.DEVICES_KV.delete(name);
 }
 
 function isExpired(lic) {
@@ -256,6 +392,7 @@ async function handleClientLicense(request, env, cors) {
   const devices = await listDevices(env, key);
   const deviceCount = devices.length;
   const deviceLimit = lic.device_limit || 0;
+  const deviceId = String(body.device_id || '').trim();
 
   const data = {
     valid: status === 'active',
@@ -269,8 +406,20 @@ async function handleClientLicense(request, env, cors) {
   };
 
   if (status !== 'active') {
-    const msg = status === 'expired' ? 'License has expired.' : status === 'revoked' ? 'License was revoked.' : 'License is banned.';
-    return json({ ok: false, status, message: msg, data }, cors, 200);
+    const msg = status === 'expired' ? 'License has expired.' : status === 'revoked' ? 'License was revoked.' : 'License was banned by the admin.';
+    return json({ ok: false, status, message: msg, data: errDataOf(data, status) }, cors, 200);
+  }
+
+  // Permanent device ban: checked for every action (activate AND check) so a
+  // banned device is refused immediately — even while the license is active and
+  // even if its device record was removed earlier.
+  if (deviceId && await isDeviceBanned(env, key, deviceId)) {
+    return json({
+      ok: false,
+      status: 'device_banned',
+      message: 'This device was banned from this license by the admin.',
+      data: errDataOf(data, 'device_banned', { device_count: deviceCount }),
+    }, cors, 200);
   }
 
   if (action === 'check') {
@@ -278,19 +427,17 @@ async function handleClientLicense(request, env, cors) {
   }
 
   // activate: register/refresh device
-  const deviceId = String(body.device_id || '').trim();
   if (!deviceId) {
-    return json({ ok: false, status: 'invalid', message: 'device_id is required.', data }, cors, 400);
+    return json({ ok: false, status: 'invalid', message: 'device_id is required.', data: errDataOf(data, 'invalid') }, cors, 400);
   }
   const deviceKey = 'device:' + key + ':' + deviceId;
   const existing = await env.DEVICES_KV.get(deviceKey);
   if (!existing && deviceLimit > 0 && deviceCount >= deviceLimit) {
-    data.device_count = deviceCount;
     return json({
       ok: false,
       status: 'limit_reached',
       message: `Device limit reached (${deviceCount}/${deviceLimit}). Remove a device from the admin panel.`,
-      data,
+      data: errDataOf(data, 'limit_reached', { device_count: deviceCount }),
     }, cors, 200);
   }
   const device = {
@@ -580,6 +727,22 @@ async function handleAdmin(request, env, url, cors, path) {
     }
 
     const deviceId = decodeURIComponent(licMatch[3]);
+    if (request.method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const action = body.action;
+      if (action === 'ban') {
+        await banDevice(env, key, deviceId, {
+          name: String(body.name || ''),
+          ip: String(body.ip || ''),
+        });
+        return json({ ok: true, message: 'Device banned.' }, cors);
+      }
+      if (action === 'unban') {
+        await unbanDevice(env, key, deviceId);
+        return json({ ok: true, message: 'Device unbanned.' }, cors);
+      }
+      return json({ ok: false, message: 'Unknown device action.' }, cors, 400);
+    }
     if (request.method === 'DELETE') {
       await deleteDevice(env, key, deviceId);
       return json({ ok: true, message: 'Device removed.' }, cors);
@@ -672,6 +835,7 @@ function adminHtml() {
   button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
   button.danger { background:transparent; color:var(--red); border:1px solid var(--red); }
   button.green { background:var(--green); }
+  button.ban { background:rgba(255,92,92,.15); color:var(--red); border:1px solid var(--red); font-weight:700; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:#8fa3c0; font-weight:600; font-size:12px; text-transform:uppercase; }
@@ -737,8 +901,11 @@ function adminHtml() {
           <input id="cPlan" placeholder="Plan name (e.g. Pro 1 month)" />
           <input id="cLimit" type="number" min="0" placeholder="Device limit (0 = unlimited)" value="1" />
           <input id="cDays" type="number" min="0" placeholder="Duration in days (0 = lifetime)" value="30" />
-          <input id="cDns" placeholder="DNS servers (1.1.1.1, 1.0.0.1)" />
+          <input id="cDns" placeholder="DNS IPs, comma separated (1.1.1.1, 1.0.0.1)" />
         </div>
+        <p class="muted" style="margin:8px 0 0;">
+          All the IPs you type belong to <b>one</b> subscription DNS profile — primary + secondary together, exactly like the built-in Cloudflare server (1.1.1.1 + 1.0.0.1). They appear as a single "Subscription DNS" server in the app. For a second private server, create another license.
+        </p>
         <div class="row" style="margin-top:10px;">
           <button class="green" onclick="createLicense()">Generate license key</button>
         </div>
@@ -784,9 +951,10 @@ function adminHtml() {
         <ol style="line-height:1.8">
           <li>Deploy this Worker to Cloudflare (free plan) with the three KV namespaces.</li>
           <li>Set the admin key: <code>wrangler secret put ADMIN_KEY</code> (or, on first boot, the panel asks you to create one). Then open this page with <code>?key=YOUR_ADMIN_KEY</code> or paste the key on login.</li>
-          <li>Create a license: set a plan, device limit, duration and the private DNS servers (IPs).</li>
+          <li>Create a license: set a plan, device limit, duration and the private DNS IPs (all comma-separated IPs form <b>one</b> subscription DNS profile, e.g. <code>1.1.1.1, 1.0.0.1</code>).</li>
           <li>Share the generated key with your users. They enter it in the app → the DNS is unlocked.</li>
           <li>The app never shows the real subscription DNS — only an "active" switch.</li>
+          <li>To cut someone off: <b>Ban</b> the whole license (instant, applies to every device), or open <b>Devices</b> and <b>Ban</b> that one device. Bans are permanent until you un-ban them — the app re-checks while running, so a banned device loses access within a minute and cannot reconnect.</li>
           <li>When you publish a new release, set the new <b>minimum version</b> (or kill the old one). Users on older builds get a forced-update screen with a direct APK download.</li>
         </ol>
         <p class="muted">Client endpoint: <code>POST /api/client/license</code> • Release endpoint: <code>GET /api/client/release</code></p>
@@ -964,6 +1132,11 @@ async function loadLicenses() {
   const data = await api('/licenses');
   const rows = data.data.map(l => {
     const statusClass = l.status;
+    const statusAction = l.status === 'active'
+      ? \`<button class="ban" onclick="banLicense('\${l.key}')">Ban</button>\`
+      : (l.status === 'banned' || l.status === 'revoked')
+        ? \`<button class="green" onclick="reactivateLicense('\${l.key}')">Un-ban</button>\`
+        : '';
     return \`<tr>
       <td><code>\${l.key}</code></td>
       <td>\${l.plan_name}</td>
@@ -972,6 +1145,7 @@ async function loadLicenses() {
       <td>\${l.expires_at ? fmtDate(l.expires_at) : 'Lifetime'}</td>
       <td class="muted">\${(l.dns_servers || []).join(', ') || '—'}</td>
       <td>
+        \${statusAction}
         <button class="ghost" onclick="showDevices('\${l.key}')">Devices</button>
         <button class="ghost" onclick="copyKey('\${l.key}')">Copy</button>
         <button class="danger" onclick="deleteLicense('\${l.key}')">Delete</button>
@@ -979,6 +1153,20 @@ async function loadLicenses() {
     </tr>\`;
   }).join('');
   document.getElementById('licTable').innerHTML = rows || '<tr><td colspan="7" class="muted">No licenses yet.</td></tr>';
+}
+
+async function banLicense(key) {
+  if (!confirm('Ban license ' + key + '? Every device on it immediately loses access. You can un-ban it later.')) return;
+  await api('/licenses', { method: 'POST', body: JSON.stringify({ action: 'ban', key }) });
+  toast('License banned');
+  await loadLicenses();
+}
+
+async function reactivateLicense(key) {
+  if (!confirm('Un-ban license ' + key + '? Devices can activate again.')) return;
+  await api('/licenses', { method: 'POST', body: JSON.stringify({ action: 'reactivate', key }) });
+  toast('License reactivated');
+  await loadLicenses();
 }
 
 async function createLicense() {
@@ -1001,24 +1189,55 @@ async function deleteLicense(key) {
   await loadLicenses();
 }
 
+function esc(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 async function showDevices(key) {
   currentLicenseKey = key;
   const data = await api('/license/' + key);
-  document.getElementById('devicesTitle').textContent = 'Devices of ' + key + ' (' + data.data.devices.length + '/' + (data.data.device_limit || '∞') + ')';
-  document.getElementById('devicesTable').innerHTML = data.data.devices.map(d => \`<tr>
-    <td>\${d.name}</td>
-    <td><code>\${d.id}</code></td>
-    <td>\${fmtDate(d.last_seen)}</td>
-    <td class="muted">\${d.ip || '—'}</td>
-    <td><button class="danger" onclick="removeDevice('\${d.id}')">Remove</button></td>
-  </tr>\`).join('') || '<tr><td colspan="5" class="muted">No devices.</td></tr>';
+  const devs = data.data.devices || [];
+  document.getElementById('devicesTitle').textContent = 'Devices of ' + key + ' (' + devs.length + '/' + (data.data.device_limit || '∞') + ')';
+  document.getElementById('devicesTable').innerHTML = devs.map(d => {
+    const idJs = JSON.stringify(d.id);
+    const badge = d.banned ? '<span class="badge banned">banned</span> ' : '';
+    const banAction = d.banned
+      ? \`<button class="green" onclick='deviceAction(\${idJs}, "unban")'>Un-ban</button>\`
+      : \`<button class="ban" onclick='deviceAction(\${idJs}, "ban")'>Ban</button>\`;
+    return \`<tr>
+      <td>\${badge}\${esc(d.name)}</td>
+      <td><code>\${esc(d.id)}</code></td>
+      <td>\${fmtDate(d.last_seen)}</td>
+      <td class="muted">\${esc(d.ip) || '—'}</td>
+      <td>
+        \${banAction}
+        <button class="ghost" onclick='removeDevice(\${idJs}, \${d.banned})'>Remove</button>
+      </td>
+    </tr>\`;
+  }).join('') || '<tr><td colspan="5" class="muted">No devices.</td></tr>';
   document.getElementById('devicesModal').classList.add('open');
 }
 
 function closeModal() { document.getElementById('devicesModal').classList.remove('open'); }
 
-async function removeDevice(id) {
-  if (!confirm('Remove device ' + id + '?')) return;
+async function deviceAction(id, action) {
+  if (action === 'ban' && !confirm('Ban device ' + id + '? It is blocked permanently — even if it tries to register again — until you un-ban it. Banned devices keep occupying a slot.')) return;
+  if (action === 'unban' && !confirm('Un-ban device ' + id + '? It may connect again (while the license allows it).')) return;
+  await api('/license/' + currentLicenseKey + '/devices/' + encodeURIComponent(id), {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+  });
+  toast(action === 'ban' ? 'Device banned' : 'Device unbanned');
+  await showDevices(currentLicenseKey);
+}
+
+async function removeDevice(id, banned) {
+  const warn = banned
+    ? 'Remove the entry of banned device ' + id + '? It stays banned (its slot stays occupied) until you un-ban it.'
+    : 'Remove device ' + id + '? This only removes its entry — the device can register again on its next activation. Use Ban to block it permanently.';
+  if (!confirm(warn)) return;
   await api('/license/' + currentLicenseKey + '/devices/' + encodeURIComponent(id), { method: 'DELETE' });
   toast('Device removed');
   await showDevices(currentLicenseKey);
