@@ -26,18 +26,24 @@ jobs:
           set +e
           flutter test --machine > /tmp/machine.log 2>&1
           echo "TEST_EXIT=$?" >> "$GITHUB_ENV"
+          echo "LOG_LINES=$(wc -l < /tmp/machine.log)" >> "$GITHUB_ENV"
 
       - name: Surface failures as annotations
         if: always()
         run: |
+          echo "::error::DEBUG-MARKER log_lines=$LOG_LINES exit=$TEST_EXIT"
           python3 - <<'PY'
-          import json, re
+          import json
 
           def esc(s):
               return s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
 
           tests = {}
           errors = {}
+          n_start = 0
+          n_done = 0
+          n_fail = 0
+          n_err = 0
           for raw in open('/tmp/machine.log', encoding='utf-8', errors='replace'):
               line = raw.strip()
               if not line:
@@ -48,25 +54,23 @@ jobs:
                   continue
               t = ev.get('type')
               if t == 'testStart':
+                  n_start += 1
                   test = ev.get('test') or {}
                   url = test.get('url') or ''
-                  path = url
-                  if path.startswith('file://'):
-                      path = path.split('file://', 1)[1]
-                      m = re.search(r'/app/(.*)', path)
-                      path = m.group(1) if m else path.rsplit('/', 1)[-1]
-                  tests[test.get('id')] = (test.get('name') or '?', path)
+                  fname = url.split('/')[-1] if url else 'unknown'
+                  tests[test.get('id')] = (test.get('name') or '?', fname)
               elif t == 'error':
+                  n_err += 1
                   tid = ev.get('testID')
                   errors.setdefault(tid, []).append(ev.get('error') or '')
-              elif t == 'testDone' and ev.get('result') in ('failure', 'error'):
-                  if ev.get('hidden'):
-                      continue
-                  tid = ev.get('testID')
-                  name, path = tests.get(tid, ('?', '?'))
-                  msg = errors.get(tid) or [ev.get('error') or '']
-                  text = '\n'.join(x for x in msg if x).strip()
-                  if not text:
-                      text = '(no message)'
-                  print(f"::error file={path},line=1,col=1::{esc(name + ' :: ' + text[:800])}")
+              elif t == 'testDone':
+                  n_done += 1
+                  if ev.get('result') in ('failure', 'error') and not ev.get('hidden'):
+                      n_fail += 1
+                      tid = ev.get('testID')
+                      name, fname = tests.get(tid, ('?', '?'))
+                      msg = errors.get(tid) or ['(no message)']
+                      text = ' | '.join(x for x in msg if x).strip()
+                      print(f"::error file={fname},line=1,col=1::{esc(name + ' :: ' + text[:1200])}")
+          print(f"::error::DEBUG-STATS start={n_start} done={n_done} fail={n_fail} err_events={n_err}")
           PY
