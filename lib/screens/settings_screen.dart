@@ -155,6 +155,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     contentPadding: EdgeInsets.zero,
                     activeColor: const Color(0xFF00D1B2),
                   ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.refresh, color: Colors.white54),
+                    title: const Text('بازنشانی تنظیمات'),
+                    subtitle: const Text(
+                      'جميع تنظیمات (DNS شخصی، انتخاب برنامه) به حالت اولیه بازمی‌گرداند.',
+                      style: TextStyle(color: Colors.white54),
+                    ),
+                    onTap: _saving
+                        ? null
+                        : () async {
+                            final confirmed = await showDialog<bool>(
+                              context: context,
+                              builder: (context) => AlertDialog(
+                                title: const Text('بازنشانی تنظیمات'),
+                                content: const Text(
+                                  'آیا realmente می‌خواهید تمام تنظیمات را به حالت پیش‌فرض برگردانید؟ این اقدام DNS شخصی ذخیره شده و انتخاب برنامه را پاک می‌کند.',
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context, false),
+                                    child: const Text('انصراف'),
+                                  ),
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context, true),
+                                    child: const Text('بازنشانی'),
+                                  ),
+                                ],
+                              ),
+                            );
+                            if (confirmed != true) return;
+                            final prefs = await SharedPreferences.getInstance();
+                            await prefs.setString(
+                                TargetPackagePolicy.prefsKey,
+                                TargetPackagePolicy.defaultTargetPackage);
+                            await prefs.setBool('focus_game', false);
+                            setState(() {
+                              focusGame = false;
+                              _pkgController.text =
+                                  TargetPackagePolicy.defaultTargetPackage;
+                            });
+                            _snack('تنظیمات به حالت پیش‌فرض برگرداند');
+                          },
+                  ),
                   TextField(
                     key: const Key('settings_target_package'),
                     controller: _pkgController,
