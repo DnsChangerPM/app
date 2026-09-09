@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/dns_server.dart';
 import '../services/custom_dns_service.dart';
+import '../services/dns_backup_service.dart';
+import '../services/dns_speed_test_service.dart';
 
 class CustomDnsScreen extends StatefulWidget {
   const CustomDnsScreen({super.key});
@@ -12,6 +15,7 @@ class CustomDnsScreen extends StatefulWidget {
 
 class _CustomDnsScreenState extends State<CustomDnsScreen> {
   final _service = CustomDnsService();
+  final _backupService = DnsBackupService.instance;
   List<DnsServer> _profiles = [];
   bool _loading = true;
 
@@ -72,12 +76,105 @@ class _CustomDnsScreenState extends State<CustomDnsScreen> {
     }
   }
 
+  Future<void> _exportProfiles() async {
+    if (_profiles.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('سرور شخصی برای خروجی گرفتن وجود ندارد.')),
+      );
+      return;
+    }
+    await _backupService.copyToClipboard(_profiles);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('تنظیمات DNS شخصی در کلیپ‌بورد کپی شد.')),
+      );
+    }
+  }
+
+  Future<void> _importProfiles() async {
+    final controller = TextEditingController();
+    final imported = await showDialog<bool>(
+      context: context,
+      builder: (context) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text('ورود DNS از فایل / متن JSON'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('متن JSON پشتیبان را در کادر زیر جای‌گذاری کنید:', style: TextStyle(fontSize: 13, color: Colors.white70)),
+              const SizedBox(height: 10),
+              TextField(
+                controller: controller,
+                maxLines: 5,
+                textDirection: TextDirection.ltr,
+                decoration: const InputDecoration(
+                  hintText: '{\n  "custom_servers": [...]\n}',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                final data = await Clipboard.getData(Clipboard.kTextPlain);
+                if (data?.text != null) controller.text = data!.text!;
+              },
+              child: const Text('جای‌گذاری از کلیپ‌بورد'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('انصراف'),
+            ),
+            FilledButton(
+              onPressed: () async {
+                try {
+                  final count = await _backupService.importAndSave(controller.text);
+                  if (context.mounted) {
+                    Navigator.pop(context, true);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('$count سرور DNS با موفقیت اضافه شد.')),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(e.toString())),
+                    );
+                  }
+                }
+              },
+              child: const Text('ورود و ذخیره'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (imported == true && mounted) await _load();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(
-        appBar: AppBar(title: const Text('DNS شخصی')),
+        appBar: AppBar(
+          title: const Text('DNS شخصی'),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.file_upload_outlined),
+              tooltip: 'خروجی گرفتن',
+              onPressed: _exportProfiles,
+            ),
+            IconButton(
+              icon: const Icon(Icons.file_download_outlined),
+              tooltip: 'ورود از پشتیبان',
+              onPressed: _importProfiles,
+            ),
+          ],
+        ),
         body: _loading
             ? const Center(child: CircularProgressIndicator())
             : ListView(
@@ -161,6 +258,8 @@ class _DnsEditorState extends State<_DnsEditor> {
   late final TextEditingController _primary;
   late final TextEditingController _secondary;
   bool _saving = false;
+  bool _testing = false;
+  int? _testPing;
   String? _error;
 
   @override
@@ -182,6 +281,30 @@ class _DnsEditorState extends State<_DnsEditor> {
     _primary.dispose();
     _secondary.dispose();
     super.dispose();
+  }
+
+  Future<void> _testConnection() async {
+    final ip = _primary.text.trim();
+    if (CustomDnsService.addressError(ip) != null) {
+      setState(() => _error = 'ابتدا یک آدرس معتبر برای DNS اصلی وارد کنید');
+      return;
+    }
+    setState(() {
+      _testing = true;
+      _testPing = null;
+      _error = null;
+    });
+
+    final ping = await DnsSpeedTestService.instance.pingAddress(ip);
+    if (mounted) {
+      setState(() {
+        _testing = false;
+        _testPing = ping;
+        if (ping == null) {
+          _error = 'پاسخی از این سرور دریافت نشد (Timeout)';
+        }
+      });
+    }
   }
 
   Future<void> _save() async {
@@ -237,6 +360,31 @@ class _DnsEditorState extends State<_DnsEditor> {
                   _addressField(_primary, optional: false),
                   const SizedBox(height: 16),
                   _addressField(_secondary, optional: true),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: _testing || _saving ? null : _testConnection,
+                        icon: _testing
+                            ? const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.speed, size: 16),
+                        label: const Text('تست پینگ سرور'),
+                      ),
+                      if (_testPing != null)
+                        Text(
+                          'پینگ: $_testPing ms',
+                          style: const TextStyle(
+                            color: Color(0xFF00D1B2),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                    ],
+                  ),
                   if (_error != null) ...[
                     const SizedBox(height: 12),
                     Text(_error!,

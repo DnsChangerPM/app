@@ -4,7 +4,11 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.content.pm.ResolveInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import androidx.core.content.ContextCompat
@@ -55,7 +59,9 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
                     val config = VpnConfig.parse(
                         call.argument<List<String>>("addresses") ?: emptyList(),
                         call.argument<Number>("port")?.toInt() ?: 53,
-                        call.argument<List<String>>("allowedPackages") ?: emptyList()
+                        call.argument<List<String>>("allowedPackages") ?: emptyList(),
+                        call.argument<List<String>>("disallowedPackages") ?: emptyList(),
+                        call.argument<Boolean>("enableIpv6") ?: true
                     )
                     if (activity.packageName in config.allowedPackages) throw VpnFailure("invalid_target")
                     begin(Request(config, false))
@@ -86,6 +92,46 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
                 "openNotificationSettings" -> {
                     activity.startActivity(VpnNotifications.settingsIntent(activity))
                     result.success(null)
+                }
+                "getInstalledApps" -> {
+                    val pm = activity.packageManager
+                    val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                    }
+                    val resolved = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0L))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pm.queryIntentActivities(mainIntent, 0)
+                    }
+                    val list = resolved.mapNotNull { resolveInfo ->
+                        val pkg = resolveInfo.activityInfo?.packageName ?: return@mapNotNull null
+                        if (pkg == activity.packageName) return@mapNotNull null
+                        val label = resolveInfo.loadLabel(pm)?.toString() ?: pkg
+                        val isSystem = (resolveInfo.activityInfo.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                        mapOf(
+                            "packageName" to pkg,
+                            "appName" to label,
+                            "isSystemApp" to isSystem
+                        )
+                    }.distinctBy { it["packageName"] }
+                    result.success(list)
+                }
+                "getNetworkInfo" -> {
+                    val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                    val active = cm.activeNetwork
+                    val caps = active?.let { cm.getNetworkCapabilities(it) }
+                    val type = when {
+                        caps == null -> "none"
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                        else -> "other"
+                    }
+                    result.success(mapOf(
+                        "type" to type,
+                        "isConnected" to (active != null)
+                    ))
                 }
                 else -> result.notImplemented()
             }
@@ -119,8 +165,6 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
     }
 
     private fun currentRequest(): Request? {
-        // Stop/update-gate/notification disconnect or OS revocation can cancel a
-        // flow while a system dialog is still open. Its later result is stale.
         if (VpnRuntime.snapshot.phase != VpnPhase.REQUESTING_PERMISSION) pending = null
         return pending
     }
@@ -137,8 +181,6 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
 
     fun onNotificationPermissionResult(requestCode: Int): Boolean {
         if (requestCode != NOTIFICATION_PERMISSION_CODE) return false
-        // Denial does not mean VPN consent was denied. Android can run an FGS
-        // without a drawer notification; the UI explains how to enable it.
         requestVpnConsent()
         return true
     }
@@ -160,10 +202,11 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
         request.config?.let { config ->
             intent.putStringArrayListExtra(DnsVpnService.EXTRA_ADDRESSES, ArrayList(config.encodedAddresses))
             intent.putStringArrayListExtra(DnsVpnService.EXTRA_ALLOWED_PACKAGES, ArrayList(config.allowedPackages))
+            intent.putStringArrayListExtra(DnsVpnService.EXTRA_DISALLOWED_PACKAGES, ArrayList(config.disallowedPackages))
+            intent.putExtra(DnsVpnService.EXTRA_ENABLE_IPV6, config.enableIpv6)
             intent.putExtra(DnsVpnService.EXTRA_PORT, 53)
         }
         try {
-            // Uses startForegroundService on Android 8+, startService on 7.
             ContextCompat.startForegroundService(activity, intent)
         } catch (_: Exception) {
             VpnRuntime.publish(if (request.resume && VpnRuntime.serviceAlive) VpnPhase.PAUSED else VpnPhase.ERROR, "start_failed")
@@ -186,6 +229,5 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
             rejectPending("permission_denied")
         }
         pending = null
-        // Closing the activity must not stop an active/paused foreground VPN.
     }
 }
