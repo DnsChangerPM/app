@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Emit GitHub Actions annotations for flutter test --machine failures."""
+import json
 import sys
 
 
@@ -10,7 +11,6 @@ def esc(s):
 def relpath(p):
     if not p:
         return None
-    # /home/runner/work/<repo>/<repo>/test/foo_test.dart -> test/foo_test.dart
     parts = p.rsplit('/app/', 1)
     if len(parts) == 2:
         return parts[1]
@@ -22,13 +22,14 @@ def main():
     suites = {}
     tests = {}
     errors = {}
-    n_start = n_done = n_fail = n_err = n_json = 0
+    prints = {}
+    n_json = 0
     for raw in open(path, encoding='utf-8', errors='replace'):
         line = raw.strip()
         if not line:
             continue
         try:
-            ev = __import__('json').loads(line)
+            ev = json.loads(line)
         except Exception:
             continue
         if not isinstance(ev, dict):
@@ -39,27 +40,32 @@ def main():
             s = ev.get('suite') or {}
             suites[s.get('id')] = s.get('path') or ''
         elif t == 'testStart':
-            n_start += 1
             test = ev.get('test') or {}
             url = test.get('url') or suites.get(test.get('suiteID'), '')
             fname = relpath(url) or 'unknown'
             tests[test.get('id')] = (test.get('name') or '?', fname)
         elif t == 'error':
-            n_err += 1
             tid = ev.get('testID')
             errors.setdefault(tid, []).append(ev.get('error') or '')
+        elif t == 'print':
+            tid = ev.get('testID')
+            prints.setdefault(tid, []).append(ev.get('message') or '')
         elif t == 'testDone':
-            n_done += 1
             if ev.get('result') in ('failure', 'error') and not ev.get('hidden'):
-                n_fail += 1
                 tid = ev.get('testID')
                 name, fname = tests.get(tid, ('?', '?'))
-                msg = errors.get(tid) or ['(no message)']
-                text = ' | '.join(x for x in msg if x).strip()
+                pieces = []
+                for m in errors.get(tid, []):
+                    if m and 'See exception logs above' not in m:
+                        pieces.append(m)
+                for m in prints.get(tid, []):
+                    pieces.append(m)
+                text = '\n'.join(x for x in pieces if x).strip()
+                if not text:
+                    text = 'Test failed. See exception logs above.'
                 print('::error file=%s,line=1,col=1::%s'
-                      % (fname, esc(name + ' :: ' + text[:1200])))
-    print('::error::DEBUG-STATS json=%d start=%d done=%d fail=%d err_events=%d'
-          % (n_json, n_start, n_done, n_fail, n_err))
+                      % (fname, esc(name + ' :: ' + text[:2500])))
+    print('::error::DEBUG-STATS json=%d' % n_json)
 
 
 if __name__ == '__main__':
