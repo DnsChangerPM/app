@@ -7,16 +7,24 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/dns_server.dart';
 import '../models/license_info.dart';
 import '../models/vpn_status.dart';
+import '../services/app_filter_service.dart';
 import '../services/custom_dns_service.dart';
 import '../services/dns_catalog.dart';
+import '../services/dns_settings_service.dart';
+import '../services/dns_speed_test_service.dart';
+import '../services/dns_stats_service.dart';
 import '../services/license_service.dart';
 import '../services/target_package_policy.dart';
 import '../services/version_service.dart';
 import '../services/vpn_service.dart';
 import '../widgets/server_card.dart';
+import 'app_filter_screen.dart';
 import 'custom_dns_screen.dart';
 import 'license_screen.dart';
+import 'network_tools_screen.dart';
 import 'settings_screen.dart';
+import 'speed_test_screen.dart';
+import 'stats_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -29,6 +37,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final VpnServiceController _vpn = VpnServiceController();
   final LicenseService _license = LicenseService();
   final CustomDnsService _customDns = CustomDnsService();
+  final DnsSpeedTestService _speedTest = DnsSpeedTestService.instance;
+  final DnsStatsService _stats = DnsStatsService.instance;
+  final DnsSettingsService _settings = DnsSettingsService.instance;
+  final AppFilterService _appFilter = AppFilterService();
+
   StreamSubscription<VpnStatus>? _statusSubscription;
   VpnStatus _status = const VpnStatus();
   String? _commandError;
@@ -42,10 +55,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   List<DnsServer> servers = List.of(freeDnsServers);
   LicenseInfo? licenseInfo;
+  DnsCategory _selectedCategory = DnsCategory.all;
+  String _searchQuery = '';
+  int? _activePing;
 
-  /// How often the app re-validates an active subscription while running, so a
-  /// license/device ban from the panel takes effect within a minute instead of
-  /// letting the user keep the private DNS for hours.
   static const Duration _licenseHeartbeatInterval = Duration(seconds: 45);
   Timer? _licenseHeartbeat;
   bool _licenseBusy = false;
@@ -54,6 +67,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _stats.init();
+    _settings.load();
     _statusSubscription = _vpn.states.listen(_applyStatus, onError: (_) {
       if (mounted) {
         setState(() => _commandError = vpnErrorMessage('unavailable'));
@@ -69,10 +84,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _applyStatus(VpnStatus status) {
     if (!mounted || status.revision < _status.revision) return;
+    final wasConnected = _status.isConnected;
+    final isNowConnected = status.isConnected;
+
+    if (!wasConnected && isNowConnected) {
+      _stats.onVpnConnected();
+      _measureActivePing();
+    } else if (wasConnected && !isNowConnected) {
+      _stats.onVpnDisconnected();
+    }
+
     setState(() {
       if (status.revision > _status.revision) _commandError = null;
       _status = status;
     });
+  }
+
+  Future<void> _measureActivePing() async {
+    final server = _selectedServer;
+    if (server == null) return;
+    final ping = await _speedTest.pingServer(server);
+    if (mounted && _status.isConnected) {
+      setState(() => _activePing = ping);
+    }
   }
 
   Future<void> _syncVpnStatus() async {
@@ -89,14 +123,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_syncVpnStatus());
-      // Coming back to the app is a good moment to re-validate the license so
-      // a ban that happened while the app was in the background takes effect.
       if (licenseInfo?.isActive ?? false) unawaited(_refreshLicense());
     }
   }
 
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _statusSubscription?.cancel();
+    _licenseHeartbeat?.cancel();
+    super.dispose();
+  }
+
   Future<void> _loadLocalState() async {
     await _license.load();
+    await _appFilter.load();
     final prefs = await SharedPreferences.getInstance();
     final custom = await _customDns.load();
     await _syncVpnStatus();
@@ -108,8 +149,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     final nextServer = nextServers.firstWhere((server) => server.id == nextId);
     final nextFocus = prefs.getBool('focus_game') ?? false;
-    // The single-app target is a licensed feature: free installs always fall
-    // back to the default package, whatever is stored in preferences.
     final nextPackage = TargetPackagePolicy.resolve(
       prefs.getString(TargetPackagePolicy.prefsKey),
       licenseActive: _license.cachedInfo?.isActive ?? false,
@@ -118,8 +157,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         !listEquals(_selectedServer?.addresses, nextServer.addresses) ||
         focusGame != nextFocus ||
         targetPackage != nextPackage;
-    // A paused session still holds its old configuration in the native service.
-    // Clear it as well when a profile is edited/deleted or scope is changed.
+
     if (!_loading && _status.hasSession && changed) {
       if (!await _disconnectForChange()) return;
     }
@@ -136,8 +174,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await prefs.setString('selected_server', selectedId);
   }
 
-  /// Starts/stops the periodic subscription re-validation. Runs only while a
-  /// license is cached and active, so a panel-side ban kicks in quickly.
   void _syncLicenseHeartbeat() {
     final shouldRun = _license.licenseKey != null &&
         _license.cachedInfo?.isActive == true &&
@@ -156,9 +192,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<DnsServer> _buildServerList(List<DnsServer> custom, LicenseInfo? info) {
     final list = <DnsServer>[...custom, ...freeDnsServers];
     if (info != null && info.isActive) {
-      // A license's DNS IPs are ONE subscription profile: primary + secondary
-      // together (like the built-in Cloudflare card with 1.1.1.1 + 1.0.0.1),
-      // not one separate server per IP.
       final addresses = <String>[];
       for (final raw in info.dnsServers) {
         final address = raw.trim();
@@ -173,6 +206,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           description: 'Private subscription server',
           addresses: addresses,
           isPremium: true,
+          category: DnsCategory.general,
         ));
       }
     }
@@ -183,8 +217,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_licenseBusy) return;
     _licenseBusy = true;
     try {
-      // Always identify the device so a per-device ban is answered on check()
-      // too, not only during the first activation.
       await _license.check(deviceId: await _license.ensureDeviceId());
       if (mounted) await _loadLocalState();
     } finally {
@@ -197,6 +229,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (server.id == selectedId) return server;
     }
     return null;
+  }
+
+  List<DnsServer> get _filteredServers {
+    return servers.where((s) {
+      if (_selectedCategory != DnsCategory.all && s.category != _selectedCategory) {
+        return false;
+      }
+      if (_searchQuery.isNotEmpty) {
+        final q = _searchQuery.toLowerCase();
+        final matchName = s.name.toLowerCase().contains(q);
+        final matchDesc = s.description.toLowerCase().contains(q);
+        final matchIp = s.addresses.any((a) => a.contains(q));
+        if (!matchName && !matchDesc && !matchIp) return false;
+      }
+      return true;
+    }).toList();
   }
 
   Future<bool> _disconnectForChange() async {
@@ -224,13 +272,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     try {
       if (_status.hasSession && !await _disconnectForChange()) return;
       if (!mounted) return;
-      setState(() => selectedId = server.id);
+      setState(() {
+        selectedId = server.id;
+        _activePing = null;
+      });
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('selected_server', server.id);
     } catch (error) {
       _showError(error);
     } finally {
       if (mounted) setState(() => _commandPending = false);
+    }
+  }
+
+  Future<void> _autoSelectFastest() async {
+    if (busy) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('در حال بررسی سرعت و انتخاب سریع‌ترین DNS…')),
+    );
+
+    final best = await _speedTest.findFastest(servers.where((s) => !s.isPremium || (licenseInfo?.isActive ?? false)).toList());
+    if (best != null && mounted) {
+      await _selectServer(best);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('سریع‌ترین سرور (${best.name}) انتخاب شد.')),
+      );
     }
   }
 
@@ -245,8 +311,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (server == null) return;
       if (server.isPremium && !(licenseInfo?.isActive ?? false)) return;
       if (server.isPremium) {
-        // Re-validate before handing out private DNS, so a license/device ban
-        // made in the panel locks the subscription immediately.
         setState(() => _commandPending = true);
         LicenseInfo fresh;
         try {
@@ -266,14 +330,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           return;
         }
       }
-      // Re-resolve right before starting so a revoked/expired license instantly
-      // falls back to the free default package.
-      final effectivePackage = TargetPackagePolicy.resolve(
-        targetPackage,
+
+      final filterScope = _appFilter.resolveForVpn(
         licenseActive: _license.cachedInfo?.isActive ?? false,
+        singleTargetPackage: targetPackage,
       );
-      await _runCommand(() => _vpn.start(server.addresses,
-          allowedPackages: focusGame ? [effectivePackage] : <String>[]));
+
+      final effectivePackages = focusGame
+          ? [
+              TargetPackagePolicy.resolve(
+                targetPackage,
+                licenseActive: _license.cachedInfo?.isActive ?? false,
+              )
+            ]
+          : filterScope.allowed;
+
+      await _runCommand(() => _vpn.start(
+            server.addresses,
+            allowedPackages: effectivePackages,
+            disallowedPackages: filterScope.disallowed,
+            enableIpv6: _settings.enableIpv6,
+            timeoutMs: _settings.queryTimeoutMs,
+          ));
     }
   }
 
@@ -295,9 +373,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _showError(Object error) {
     if (!mounted) return;
-    setState(() => _commandError = error is VpnException
-        ? error.message
-        : vpnErrorMessage('command_failed'));
+    final message = error is VpnException ? error.message : error.toString();
+    setState(() => _commandError = message);
   }
 
   Future<void> _openNotificationSettings() async {
@@ -308,91 +385,238 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  @override
-  void dispose() {
-    _licenseHeartbeat?.cancel();
-    WidgetsBinding.instance.removeObserver(this);
-    _statusSubscription?.cancel();
-    super.dispose();
+  String _formatDuration(Duration d) {
+    final hours = d.inHours.toString().padLeft(2, '0');
+    final minutes = (d.inMinutes % 60).toString().padLeft(2, '0');
+    final seconds = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return '$hours:$minutes:$seconds';
   }
 
   @override
   Widget build(BuildContext context) {
-    final vs = VersionService.instance;
-    if (_loading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('DNS Changer', style: TextStyle(fontWeight: FontWeight.bold)),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.settings_outlined),
+              tooltip: 'Settings',
+              onPressed: () => _openSettings(),
+            ),
+          ],
+        ),
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : RefreshIndicator(
+                onRefresh: () async {
+                  await _loadLocalState();
+                  if (licenseInfo?.isActive ?? false) await _refreshLicense();
+                },
+                child: ListView(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  children: [
+                    _statusCard(),
+                    if (!_status.notificationsEnabled) ...[
+                      const SizedBox(height: 12),
+                      _notificationWarning(),
+                    ],
+                    const SizedBox(height: 16),
+                    _quickToolsBar(),
+                    const SizedBox(height: 16),
+                    if (licenseInfo != null && licenseInfo!.isActive) ...[
+                      _licenseBanner(),
+                      const SizedBox(height: 16),
+                    ],
 
-    return Scaffold(
-      body: SafeArea(
-        child: RefreshIndicator(
-          onRefresh: () async {
-            await _loadLocalState();
-            await _refreshLicense();
-            await vs.refresh();
-          },
-          child: ListView(
-            padding: const EdgeInsets.all(16),
-            children: [
-              _header(),
-              const SizedBox(height: 20),
-              _statusCard(),
-              if (!_status.notificationsEnabled) ...[
-                const SizedBox(height: 12),
-                _notificationWarning(),
-              ],
-              const SizedBox(height: 20),
-              if (licenseInfo != null && licenseInfo!.isActive) ...[
-                _licenseBanner(),
-                const SizedBox(height: 16),
-              ],
-              Row(
-                children: [
-                  Expanded(child: _sectionTitle('DNS Servers')),
-                  TextButton.icon(
-                    onPressed: _openCustomDns,
-                    icon: const Icon(Icons.add),
-                    label: const Text('DNS شخصی'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              for (final s in servers) ...[
-                ServerCard(
-                  server: s,
-                  selected: s.id == selectedId,
-                  locked: s.isPremium && !(licenseInfo?.isActive ?? false),
-                  onTap: busy ? null : () => _selectServer(s),
+                    // Search & Category Chips
+                    _searchAndFilterHeader(),
+                    const SizedBox(height: 10),
+
+                    // Server List
+                    for (final s in _filteredServers) ...[
+                      ServerCard(
+                        server: s,
+                        selected: s.id == selectedId,
+                        locked: s.isPremium && !(licenseInfo?.isActive ?? false),
+                        onTap: busy ? null : () => _selectServer(s),
+                      ),
+                      const SizedBox(height: 6),
+                    ],
+
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: _openLicense,
+                      icon: const Icon(Icons.workspace_premium),
+                      label: const Text('Activate subscription'),
+                    ),
+                    const SizedBox(height: 32),
+                  ],
                 ),
-                const SizedBox(height: 10),
-              ],
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: _openLicense,
-                icon: const Icon(Icons.workspace_premium),
-                label: const Text('Activate subscription'),
               ),
-              const SizedBox(height: 24),
-            ],
+      ),
+    );
+  }
+
+  Widget _quickToolsBar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF111B2E),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.06)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _quickActionItem(
+            icon: Icons.bolt,
+            label: 'سریع‌ترین',
+            color: const Color(0xFF00D1B2),
+            onTap: _autoSelectFastest,
           ),
+          _quickActionItem(
+            icon: Icons.speed,
+            label: 'تست پینگ',
+            color: const Color(0xFF3AA6FF),
+            onTap: () async {
+              final selected = await Navigator.push<DnsServer>(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => SpeedTestScreen(
+                    currentSelectedId: selectedId,
+                    onSelectAndConnect: (server) => _selectServer(server),
+                  ),
+                ),
+              );
+              if (selected != null && mounted) {
+                await _selectServer(selected);
+              }
+            },
+          ),
+          _quickActionItem(
+            icon: Icons.filter_alt_outlined,
+            label: 'فیلتر برنامه‌ها',
+            color: const Color(0xFFFFC107),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const AppFilterScreen()),
+            ).then((_) => _loadLocalState()),
+          ),
+          _quickActionItem(
+            icon: Icons.insights,
+            label: 'آمار و لاگ',
+            color: const Color(0xFFFF5C5C),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => StatsScreen(
+                  activeServerName: _selectedServer?.name,
+                  activePing: _activePing,
+                  isConnected: running,
+                ),
+              ),
+            ),
+          ),
+          _quickActionItem(
+            icon: Icons.network_check,
+            label: 'ابزارها',
+            color: const Color(0xFF9D65FF),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => NetworkToolsScreen(
+                  servers: servers,
+                  activeServer: _selectedServer,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _quickActionItem({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, color: color, size: 20),
+            ),
+            const SizedBox(height: 4),
+            Text(label, style: const TextStyle(fontSize: 11, color: Colors.white70)),
+          ],
         ),
       ),
     );
   }
 
-  Widget _header() {
-    return Row(
+  Widget _searchAndFilterHeader() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Expanded(
-          child: Text(
-            'DNS Changer',
-            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+        Row(
+          children: [
+            Expanded(child: _sectionTitle('DNS Servers')),
+            TextButton.icon(
+              onPressed: _openCustomDns,
+              icon: const Icon(Icons.add, size: 18),
+              label: const Text('DNS شخصی'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        TextField(
+          onChanged: (v) => setState(() => _searchQuery = v),
+          decoration: InputDecoration(
+            hintText: 'جستجوی سرورها بر اساس نام یا IP…',
+            prefixIcon: const Icon(Icons.search, size: 20),
+            filled: true,
+            fillColor: const Color(0xFF111B2E),
+            contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 14),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
           ),
         ),
-        IconButton(
-          icon: const Icon(Icons.settings_outlined),
-          tooltip: 'Settings',
-          onPressed: () => _openSettings(),
+        const SizedBox(height: 8),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: DnsCategory.values.map((cat) {
+              final isSel = _selectedCategory == cat;
+              return Padding(
+                padding: const EdgeInsets.only(left: 6),
+                child: FilterChip(
+                  selected: isSel,
+                  label: Text(cat.labelFa, style: const TextStyle(fontSize: 12)),
+                  onSelected: (_) => setState(() => _selectedCategory = cat),
+                  backgroundColor: const Color(0xFF111B2E),
+                  selectedColor: const Color(0xFF3AA6FF).withOpacity(0.25),
+                  checkmarkColor: const Color(0xFF3AA6FF),
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                ),
+              );
+            }).toList(),
+          ),
         ),
       ],
     );
@@ -414,6 +638,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         : running
             ? const Color(0xFF00D1B2)
             : const Color(0xFF3AA6FF);
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -424,18 +649,33 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.white.withOpacity(0.06)),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: running ? const Color(0xFF00D1B2).withOpacity(0.3) : Colors.white.withOpacity(0.06),
+          width: 1.2,
+        ),
+        boxShadow: running
+            ? [
+                BoxShadow(
+                  color: const Color(0xFF00D1B2).withOpacity(0.12),
+                  blurRadius: 20,
+                  spreadRadius: 2,
+                )
+              ]
+            : null,
       ),
       child: Column(
         children: [
           Row(
             children: [
               Container(
-                width: 52,
-                height: 52,
+                width: 54,
+                height: 54,
                 decoration: BoxDecoration(
-                    shape: BoxShape.circle, color: accent.withOpacity(0.15)),
+                  shape: BoxShape.circle,
+                  color: accent.withOpacity(0.15),
+                  border: Border.all(color: accent.withOpacity(0.4), width: 1.5),
+                ),
                 child: Icon(
                   _status.isPaused
                       ? Icons.pause_circle_outline
@@ -443,6 +683,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ? Icons.shield
                           : Icons.shield_outlined,
                   color: accent,
+                  size: 28,
                 ),
               ),
               const SizedBox(width: 16),
@@ -454,7 +695,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         key: const Key('vpn_status_label'),
                         textDirection: TextDirection.rtl,
                         style: const TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
+                            fontSize: 19, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 4),
                     Text(
                       server == null
@@ -463,8 +704,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               ? '${server.name}  •  Private'
                               : '${server.name}  •  ${server.addresses.first}',
                       style:
-                          const TextStyle(color: Colors.white60, fontSize: 13),
+                          const TextStyle(color: Colors.white70, fontSize: 13),
                     ),
+                    if (running) ...[
+                      const SizedBox(height: 4),
+                      ListenableBuilder(
+                        listenable: _stats,
+                        builder: (context, _) => Row(
+                          children: [
+                            const Icon(Icons.timer_outlined, size: 14, color: Color(0xFF00D1B2)),
+                            const SizedBox(width: 4),
+                            Text(
+                              _formatDuration(_stats.sessionDuration),
+                              style: const TextStyle(
+                                color: Color(0xFF00D1B2),
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            if (_activePing != null) ...[
+                              const SizedBox(width: 10),
+                              const Icon(Icons.bolt, size: 14, color: Color(0xFF3AA6FF)),
+                              const SizedBox(width: 2),
+                              Text(
+                                '$_activePing ms',
+                                style: const TextStyle(
+                                  color: Color(0xFF3AA6FF),
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -487,19 +761,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ],
           const SizedBox(height: 20),
           SizedBox(
-            width: 72,
-            height: 72,
+            width: 76,
+            height: 76,
             child: FloatingActionButton.large(
               key: const Key('vpn_toggle'),
               heroTag: 'power',
               tooltip: _toggleLabel,
               backgroundColor: accent,
               foregroundColor: Colors.black,
+              elevation: 4,
               onPressed: busy ? null : _toggle,
               child: busy
                   ? const SizedBox(
-                      width: 28,
-                      height: 28,
+                      width: 30,
+                      height: 30,
                       child: CircularProgressIndicator(
                           strokeWidth: 3, color: Colors.black))
                   : Icon(
@@ -508,11 +783,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           : _status.isPaused
                               ? Icons.play_arrow
                               : Icons.power_settings_new,
-                      size: 34),
+                      size: 38),
             ),
           ),
           const SizedBox(height: 10),
-          Text(_toggleLabel, textDirection: TextDirection.rtl),
+          Text(_toggleLabel, textDirection: TextDirection.rtl, style: const TextStyle(fontWeight: FontWeight.bold)),
           if (_status.hasSession) ...[
             const SizedBox(height: 12),
             OutlinedButton.icon(
@@ -581,9 +856,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
+                const Text(
                   'Subscription active',
-                  style: const TextStyle(
+                  style: TextStyle(
                       fontWeight: FontWeight.bold, color: Color(0xFF00D1B2)),
                 ),
                 Text(

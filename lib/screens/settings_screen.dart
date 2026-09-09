@@ -4,12 +4,21 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/app_config.dart';
+import '../services/app_filter_service.dart';
+import '../services/dns_backup_service.dart';
+import '../services/dns_catalog.dart';
+import '../services/dns_settings_service.dart';
+import '../services/dns_stats_service.dart';
 import '../services/license_service.dart';
 import '../services/target_package_policy.dart';
 import '../services/version_service.dart';
 import '../services/vpn_service.dart';
+import 'app_filter_screen.dart';
 import 'custom_dns_screen.dart';
 import 'license_screen.dart';
+import 'network_tools_screen.dart';
+import 'speed_test_screen.dart';
+import 'stats_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -20,13 +29,15 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _pkgController = TextEditingController();
+  final DnsSettingsService _dnsSettings = DnsSettingsService.instance;
+  final LicenseService _license = LicenseService();
+
   bool focusGame = false;
   bool _loading = true;
   bool _saving = false;
   bool _checking = false;
   bool _licenseActive = false;
   String version = '';
-  final LicenseService _license = LicenseService();
 
   @override
   void initState() {
@@ -37,6 +48,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _init() async {
     final prefs = await SharedPreferences.getInstance();
     await _license.load();
+    await _dnsSettings.load();
+
     if (!mounted) return;
     _licenseActive = _license.cachedInfo?.isActive ?? false;
     final resolved = TargetPackagePolicy.resolve(
@@ -44,8 +57,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       licenseActive: _licenseActive,
     );
     _pkgController.text = resolved;
-    // Free installs are pinned to the default package: normalise any stale
-    // value that was saved while a license was active.
     if (prefs.getString(TargetPackagePolicy.prefsKey) != resolved) {
       await prefs.setString(TargetPackagePolicy.prefsKey, resolved);
     }
@@ -143,6 +154,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
             : ListView(
                 padding: const EdgeInsets.all(20),
                 children: [
+                  // Section: Feature Hub Navigation
+                  const Text('امکانات و ابزارها',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                  const SizedBox(height: 8),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.speed, color: Color(0xFF3AA6FF)),
+                    title: const Text('تست پینگ و سرعت DNS'),
+                    subtitle: const Text('بررسی سرعت و تأخیر تمام سرورها'),
+                    trailing: const Icon(Icons.chevron_left),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const SpeedTestScreen()),
+                    ),
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.filter_alt_outlined, color: Color(0xFF00D1B2)),
+                    title: const Text('فیلتر برنامه‌ها (Split Tunneling)'),
+                    subtitle: const Text('انتخاب برنامه‌های شامل یا مستثنی از DNS'),
+                    trailing: const Icon(Icons.chevron_left),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const AppFilterScreen()),
+                    ),
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.insights, color: Color(0xFFFFC107)),
+                    title: const Text('آمار و گزارش درخواست‌ها'),
+                    subtitle: const Text('تعداد کوئری‌ها، لاگ دامنه‌ها و زمان اتصال'),
+                    trailing: const Icon(Icons.chevron_left),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const StatsScreen()),
+                    ),
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.network_check, color: Color(0xFFFF5C5C)),
+                    title: const Text('ابزارهای شبکه و تست نشت DNS'),
+                    subtitle: const Text('استعلام دامنه، اطلاعات شبکه و وضعیت Anti-Leak'),
+                    trailing: const Icon(Icons.chevron_left),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                          builder: (_) => const NetworkToolsScreen(servers: freeDnsServers)),
+                    ),
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.add_circle_outline, color: Color(0xFF3AA6FF)),
+                    title: const Text('DNS شخصی'),
+                    subtitle: const Text('افزودن، ویرایش و حذف DNS دلخواه'),
+                    trailing: const Icon(Icons.chevron_left),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const CustomDnsScreen()),
+                    ),
+                  ),
+
+                  const Divider(height: 32),
+
+                  // Section: App Scope (Target Package)
+                  const Text('محدودهٔ اعمال DNS',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                  const SizedBox(height: 8),
                   SwitchListTile(
                     value: focusGame,
                     onChanged:
@@ -155,6 +228,87 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     contentPadding: EdgeInsets.zero,
                     activeColor: const Color(0xFF00D1B2),
                   ),
+                  TextField(
+                    key: const Key('settings_target_package'),
+                    controller: _pkgController,
+                    enabled: _licenseActive && focusGame && !_saving,
+                    readOnly: !_licenseActive,
+                    textDirection: TextDirection.ltr,
+                    autocorrect: false,
+                    decoration: _decoration(
+                      'نام پکیج برنامه',
+                      TargetPackagePolicy.defaultTargetPackage,
+                      locked: !_licenseActive,
+                    ),
+                  ),
+                  if (!_licenseActive) _lockedPackageNotice(),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: (!_licenseActive || _saving) ? null : _save,
+                    icon: const Icon(Icons.save_outlined),
+                    label: Text(_saving ? 'در حال ذخیره…' : 'ذخیرهٔ تنظیمات'),
+                  ),
+
+                  const Divider(height: 32),
+
+                  // Section: Advanced Network Controls
+                  const Text('تنظیمات پیشرفته شبکه و اتصال',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                  const SizedBox(height: 8),
+                  SwitchListTile(
+                    value: _dnsSettings.enableIpv6,
+                    onChanged: (v) {
+                      _dnsSettings.update(newEnableIpv6: v);
+                      setState(() {});
+                    },
+                    title: const Text('پشتیبانی از پروتکل IPv6'),
+                    subtitle: const Text(
+                      'در صورت ناپایداری در اینترنت سیم‌کارت، خاموش کنید.',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    contentPadding: EdgeInsets.zero,
+                    activeColor: const Color(0xFF00D1B2),
+                  ),
+                  SwitchListTile(
+                    value: _dnsSettings.autoReconnect,
+                    onChanged: (v) {
+                      _dnsSettings.update(newAutoReconnect: v);
+                      setState(() {});
+                    },
+                    title: const Text('اتصال مجدد خودکار در تغییر شبکه'),
+                    subtitle: const Text(
+                      'اتصال مجدد خودکار بین وای‌فای و اینترنت همراه بدون قطعی',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    contentPadding: EdgeInsets.zero,
+                    activeColor: const Color(0xFF00D1B2),
+                  ),
+                  SwitchListTile(
+                    value: _dnsSettings.autoConnectOnBoot,
+                    onChanged: (v) {
+                      _dnsSettings.update(newAutoConnectOnBoot: v);
+                      setState(() {});
+                    },
+                    title: const Text('اتصال خودکار پس از روشن شدن دستگاه'),
+                    subtitle: const Text(
+                      'فعال‌سازی خودکار تونل DNS بعد از ریستارت گوشی',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    contentPadding: EdgeInsets.zero,
+                    activeColor: const Color(0xFF00D1B2),
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.notifications_active_outlined),
+                    title: const Text('اعلان وضعیت اتصال'),
+                    subtitle: const Text(
+                        'فعال‌سازی اعلان با دکمه‌های توقف موقت، ازسرگیری و قطع اتصال'),
+                    onTap: _openNotificationSettings,
+                  ),
+
+                  const Divider(height: 32),
+
+                  // Section: Reset & Management
                   ListTile(
                     contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.refresh, color: Colors.white54),
@@ -171,7 +325,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               builder: (context) => AlertDialog(
                                 title: const Text('بازنشانی تنظیمات'),
                                 content: const Text(
-                                  'آیا realmente می‌خواهید تمام تنظیمات را به حالت پیش‌فرض برگردانید؟ این اقدام DNS شخصی ذخیره شده و انتخاب برنامه را پاک می‌کند.',
+                                  'آیا واقعاً می‌خواهید تمام تنظیمات را به حالت پیش‌فرض برگردانید؟',
                                 ),
                                 actions: [
                                   TextButton(
@@ -191,55 +345,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 TargetPackagePolicy.prefsKey,
                                 TargetPackagePolicy.defaultTargetPackage);
                             await prefs.setBool('focus_game', false);
+                            await _dnsSettings.update(
+                              newEnableIpv6: true,
+                              newAutoReconnect: true,
+                              newAutoConnectOnBoot: false,
+                              newQueryTimeoutMs: 2500,
+                            );
                             setState(() {
                               focusGame = false;
                               _pkgController.text =
                                   TargetPackagePolicy.defaultTargetPackage;
                             });
-                            _snack('تنظیمات به حالت پیش‌فرض برگرداند');
+                            _snack('تنظیمات به حالت پیش‌فرض بازگشت');
                           },
                   ),
-                  TextField(
-                    key: const Key('settings_target_package'),
-                    controller: _pkgController,
-                    enabled: _licenseActive && focusGame && !_saving,
-                    readOnly: !_licenseActive,
-                    textDirection: TextDirection.ltr,
-                    autocorrect: false,
-                    decoration: _decoration(
-                      'نام پکیج برنامه',
-                      TargetPackagePolicy.defaultTargetPackage,
-                      locked: !_licenseActive,
-                    ),
-                  ),
-                  if (!_licenseActive) _lockedPackageNotice(),
-                  const SizedBox(height: 20),
-                  FilledButton.icon(
-                    onPressed: (!_licenseActive || _saving) ? null : _save,
-                    icon: const Icon(Icons.save_outlined),
-                    label: Text(_saving ? 'در حال ذخیره…' : 'ذخیرهٔ تنظیمات'),
-                  ),
-                  const SizedBox(height: 24),
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.add_circle_outline),
-                    title: const Text('DNS شخصی'),
-                    subtitle: const Text('افزودن، ویرایش و حذف DNS دلخواه'),
-                    trailing: const Icon(Icons.chevron_left),
-                    onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(
-                          builder: (_) => const CustomDnsScreen()),
-                    ),
-                  ),
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.notifications_active_outlined),
-                    title: const Text('اعلان وضعیت اتصال'),
-                    subtitle: const Text(
-                        'فعال‌سازی اعلان با دکمه‌های توقف موقت، ازسرگیری و قطع اتصال'),
-                    onTap: _openNotificationSettings,
-                  ),
+
                   const Divider(height: 32),
+
+                  // Section: Contact & Info
                   const Text('ارتباط با ما',
                       style: TextStyle(fontWeight: FontWeight.bold)),
                   _telegramTile('کانال تلگرام', '@DnsChangerPM',

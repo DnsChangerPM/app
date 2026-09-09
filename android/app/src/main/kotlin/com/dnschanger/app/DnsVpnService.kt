@@ -30,6 +30,8 @@ class DnsVpnService : VpnService() {
         const val EXTRA_ADDRESSES = "addresses"
         const val EXTRA_PORT = "port"
         const val EXTRA_ALLOWED_PACKAGES = "allowed_packages"
+        const val EXTRA_DISALLOWED_PACKAGES = "disallowed_packages"
+        const val EXTRA_ENABLE_IPV6 = "enable_ipv6"
         const val EXTRA_START_TICKET = "start_ticket"
         private const val MTU = 1500
 
@@ -77,7 +79,10 @@ class DnsVpnService : VpnService() {
             override fun closeTunnel() = releaseTunnel()
             override fun stopForeground() = removeNotification()
             override fun stopService() = stopSelf()
-        }) { phase, error -> VpnRuntime.publish(phase, error) }
+        }) { phase, error ->
+            VpnRuntime.publish(phase, error)
+            DnsTileService.updateTileState(this, phase == VpnPhase.CONNECTED)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -92,13 +97,14 @@ class DnsVpnService : VpnService() {
                         discardQueuedStart(startId)
                         return START_NOT_STICKY
                     }
-                    // Fulfil startForegroundService's deadline even for invalid
-                    // input. VpnSession also guarantees foreground-before-TUN.
+                    // Fulfil startForegroundService's deadline even for invalid input
                     showForeground(VpnPhase.CONNECTING)
                     val config = VpnConfig.parse(
                         intent.getStringArrayListExtra(EXTRA_ADDRESSES) ?: emptyList(),
                         intent.getIntExtra(EXTRA_PORT, 53),
-                        intent.getStringArrayListExtra(EXTRA_ALLOWED_PACKAGES) ?: emptyList()
+                        intent.getStringArrayListExtra(EXTRA_ALLOWED_PACKAGES) ?: emptyList(),
+                        intent.getStringArrayListExtra(EXTRA_DISALLOWED_PACKAGES) ?: emptyList(),
+                        intent.getBooleanExtra(EXTRA_ENABLE_IPV6, true)
                     )
                     session.start(config)
                 }
@@ -134,15 +140,10 @@ class DnsVpnService : VpnService() {
         } catch (_: Exception) {
             session.stop("start_failed")
         }
-        // Never silently reconnect after Android kills/stops the app. A paused
-        // session lives in this foreground service, not in an auto-start alarm.
         return START_NOT_STICKY
     }
 
     private fun discardQueuedStart(startId: Int) {
-        // A stop/update can arrive while startForegroundService is still queued.
-        // Satisfy Android's foreground deadline, but never establish a stale TUN
-        // or let an old stopSelf destroy a newer start request.
         if (session.config == null) {
             showForeground(VpnPhase.CONNECTING)
             removeNotification()
@@ -166,29 +167,42 @@ class DnsVpnService : VpnService() {
             .setBlocking(true)
         builder.setConfigureIntent(PendingIntent.getActivity(this, 4, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
-        try {
-            builder.addAddress(VPN_IPV6, 128)
-            builder.addDnsServer(VPN_DNS_IPV6)
-            builder.addRoute(VPN_DNS_IPV6, 128)
-        } catch (_: IllegalArgumentException) {
-            // IPv4 can still work on a device without IPv6 tunnel support.
+
+        if (config.enableIpv6) {
+            try {
+                builder.addAddress(VPN_IPV6, 128)
+                builder.addDnsServer(VPN_DNS_IPV6)
+                builder.addRoute(VPN_DNS_IPV6, 128)
+            } catch (_: IllegalArgumentException) {
+                // IPv4 can still work on a device without IPv6 tunnel support.
+            }
         }
+
         val routes = (config.upstreams.map { it.first } + EXTRA_RESOLVERS +
             (properties?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList())).distinct()
         for (ip in routes) {
+            if (!config.enableIpv6 && ip.contains(':')) continue
             try { builder.addRoute(ip, if (ip.contains(':')) 128 else 32) } catch (_: IllegalArgumentException) { }
         }
-        applyAppScope(config.allowedPackages, packageName,
+
+        applyAppScope(
+            config.allowedPackages,
+            config.disallowedPackages,
+            packageName,
             allow = { pkg ->
                 try {
                     builder.addAllowedApplication(pkg)
                 } catch (_: PackageManager.NameNotFoundException) {
-                    // Do not silently apply a focused connection to every app.
                     throw VpnFailure("target_app_missing")
                 }
             },
-            disallow = { builder.addDisallowedApplication(it) }
+            disallow = { pkg ->
+                try {
+                    builder.addDisallowedApplication(pkg)
+                } catch (_: Exception) {}
+            }
         )
+
         val fd = builder.establish() ?: throw VpnFailure("establish_failed")
         val connection = try { Tunnel(fd, generation.incrementAndGet(), config) } catch (error: Exception) {
             fd.close()
@@ -202,8 +216,6 @@ class DnsVpnService : VpnService() {
         connection.resolver!!.start()
         connection.reader = Thread({ readTunnel(connection) }, "DnsVpnReader").also { it.start() }
         watchNetwork(connection.generation, fingerprint)
-        // Returning means establish() succeeded and tunnel I/O is ready. Only
-        // now may VpnSession publish CONNECTED and Android display its VPN key.
     }
 
     private fun readTunnel(connection: Tunnel) {
@@ -261,8 +273,6 @@ class DnsVpnService : VpnService() {
 
     private fun tunnelFailed(token: Long) {
         mainHandler.post {
-            // A closed reader from an earlier pause/reconnect must never stop
-            // the replacement tunnel or erase its notification.
             if (isCurrent(token)) session.stop("tunnel_closed")
         }
     }
@@ -287,8 +297,6 @@ class DnsVpnService : VpnService() {
             try { old.output.close() } catch (_: Exception) { }
             try { old.fd.close() } catch (_: Exception) { }
         }
-        // Deliberately no stopSelf()/stopForeground() here. Pause and reconnect
-        // reuse this service; only final shutdown removes its notification.
     }
 
     private fun fingerprint(network: Network, properties: LinkProperties): String? {
@@ -308,7 +316,7 @@ class DnsVpnService : VpnService() {
                 val current = fingerprint(network, linkProperties) ?: return
                 mainHandler.post {
                     if (!isCurrent(token) || session.phase != VpnPhase.CONNECTED ||
-                        VpnRuntime.snapshot.phase != VpnPhase.CONNECTED) return@post
+                        VpnRuntime.snapshot.phase == VpnPhase.CONNECTED) return@post
                     if (networkTracker.changed(current)) {
                         mainHandler.removeCallbacks(reconnect)
                         mainHandler.postDelayed(reconnect, 750)
@@ -320,7 +328,6 @@ class DnsVpnService : VpnService() {
             cm.registerDefaultNetworkCallback(callback)
             networkCallback = callback
         } catch (_: Exception) {
-            // Optional network monitoring must not tear down a healthy TUN.
         }
     }
 
@@ -339,8 +346,6 @@ class DnsVpnService : VpnService() {
     }
 
     private fun showNotification(phase: VpnPhase, errorCode: String? = null) {
-        // FGS is allowed without POST_NOTIFICATIONS, but Android may hide the
-        // drawer entry. The UI detects that and offers notification settings.
         if (!VpnNotifications.enabled(this)) return
         try {
             getSystemService(NotificationManager::class.java)
@@ -357,8 +362,6 @@ class DnsVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        // VpnService may invoke this on a Binder thread. Serialize cleanup with
-        // start/pause/resume; session.stop already calls the default stopSelf.
         mainHandler.post {
             VpnRuntime.cancelQueuedStarts()
             session.stop("permission_revoked")
@@ -370,6 +373,7 @@ class DnsVpnService : VpnService() {
         VpnRuntime.serviceAlive = false
         if (VpnRuntime.snapshot.phase == VpnPhase.STOPPING) VpnRuntime.publish(VpnPhase.DISCONNECTED)
         mainHandler.removeCallbacksAndMessages(null)
+        DnsTileService.updateTileState(this, false)
         super.onDestroy()
     }
 }
