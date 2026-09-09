@@ -114,6 +114,10 @@ void main() {
   testWidgets(
       'a custom profile is selectable and sends its addresses to the VPN',
       (tester) async {
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     final profile = await CustomDnsService().save(
       name: 'Home DNS',
       primary: '192.168.1.1',
@@ -121,8 +125,6 @@ void main() {
     );
     await tester.pumpWidget(
         MaterialApp(home: HomeScreen(speedTest: FakeSpeedTestService())));
-    await tester.pumpAndSettle();
-    await tester.ensureVisible(find.text('Home DNS'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Home DNS'));
     await tester.pumpAndSettle();
