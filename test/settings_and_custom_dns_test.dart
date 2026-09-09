@@ -9,7 +9,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'support/fake_speed_test.dart';
+import 'support/fake_speed_tester.dart';
 import 'support/fake_vpn_platform.dart';
 
 void main() {
