@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'support/fake_speed_test.dart';
 import 'support/fake_vpn_platform.dart';
 
 void main() {
@@ -13,6 +14,9 @@ void main() {
   late FakeVpnPlatform native;
   const toggle = Key('vpn_toggle');
   const disconnect = Key('vpn_disconnect');
+
+  Widget buildApp() =>
+      MaterialApp(home: HomeScreen(speedTest: FakeSpeedTestService()));
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
@@ -33,7 +37,7 @@ void main() {
       'start stays connecting until establish succeeds and remains cancellable',
       (tester) async {
     native.autoConnect = false;
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(toggle));
     await tester.pump();
@@ -52,7 +56,7 @@ void main() {
 
   testWidgets('pause resume and full disconnect are separate native commands',
       (tester) async {
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(toggle));
     await tester.pumpAndSettle();
@@ -79,7 +83,7 @@ void main() {
   testWidgets('notification actions synchronize to an already open app',
       (tester) async {
     native.setState('connected', emit: false);
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     native.setState('paused');
     await tester.pumpAndSettle();
@@ -96,7 +100,7 @@ void main() {
   testWidgets('older snapshots cannot overwrite a newer connection state',
       (tester) async {
     native.setState('connected', emit: false);
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     native.sendEvent(
         {'state': 'connecting', 'revision': 0, 'notificationsEnabled': true});
@@ -109,7 +113,7 @@ void main() {
       'notification denial explains why controls are hidden and opens settings',
       (tester) async {
     native.setState('connected', notificationsEnabled: false, emit: false);
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     await tester
         .ensureVisible(find.byKey(const Key('vpn_enable_notifications')));
@@ -128,7 +132,7 @@ void main() {
       'returning from the background refreshes state even after a missed event',
       (tester) async {
     native.setState('connected', emit: false);
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
     native.setState('paused', emit: false);
@@ -140,7 +144,7 @@ void main() {
 
   testWidgets('establishment and permission failures never display connected',
       (tester) async {
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     native.setState('error', errorCode: 'target_app_missing');
     await tester.pumpAndSettle();
@@ -161,7 +165,7 @@ void main() {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('selected_server', profile.id);
     native.setState('paused', emit: false);
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(buildApp());
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Settings'));
     await tester.pumpAndSettle();
