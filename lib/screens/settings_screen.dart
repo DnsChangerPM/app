@@ -171,7 +171,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (!_licenseActive) _lockedPackageNotice(),
                   const SizedBox(height: 20),
                   FilledButton.icon(
-                    onPressed: _saving ? null : _save,
+                    onPressed: (!_licenseActive || _saving) ? null : _save,
                     icon: const Icon(Icons.save_outlined),
                     label: Text(_saving ? 'در حال ذخیره…' : 'ذخیرهٔ تنظیمات'),
                   ),
