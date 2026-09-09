@@ -4,9 +4,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/app_config.dart';
+import '../services/license_service.dart';
+import '../services/target_package_policy.dart';
 import '../services/version_service.dart';
 import '../services/vpn_service.dart';
 import 'custom_dns_screen.dart';
+import 'license_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -21,7 +24,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _loading = true;
   bool _saving = false;
   bool _checking = false;
+  bool _licenseActive = false;
   String version = '';
+  final LicenseService _license = LicenseService();
 
   @override
   void initState() {
@@ -31,8 +36,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _init() async {
     final prefs = await SharedPreferences.getInstance();
+    await _license.load();
     if (!mounted) return;
-    _pkgController.text = prefs.getString('target_package') ?? 'com.tencent.ig';
+    _licenseActive = _license.cachedInfo?.isActive ?? false;
+    final resolved = TargetPackagePolicy.resolve(
+      prefs.getString(TargetPackagePolicy.prefsKey),
+      licenseActive: _licenseActive,
+    );
+    _pkgController.text = resolved;
+    // Free installs are pinned to the default package: normalise any stale
+    // value that was saved while a license was active.
+    if (prefs.getString(TargetPackagePolicy.prefsKey) != resolved) {
+      await prefs.setString(TargetPackagePolicy.prefsKey, resolved);
+    }
     focusGame = prefs.getBool('focus_game') ?? false;
     try {
       final info = await PackageInfo.fromPlatform();
@@ -49,16 +65,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _save() async {
     if (_saving || _loading) return;
-    final package = _pkgController.text.trim();
-    if (focusGame &&
-        !RegExp(r'^[a-zA-Z]\w*(\.[a-zA-Z]\w*)+$').hasMatch(package)) {
+    final package = _licenseActive
+        ? _pkgController.text.trim()
+        : TargetPackagePolicy.defaultTargetPackage;
+    if (!_licenseActive &&
+        _pkgController.text.trim() != TargetPackagePolicy.defaultTargetPackage) {
+      _pkgController.text = TargetPackagePolicy.defaultTargetPackage;
+      _snack(
+          'تغییر نام پکیج فقط با لایسنس فعال ممکن است؛ نسخهٔ رایگان روی ${TargetPackagePolicy.defaultTargetPackage} قفل است.');
+      return;
+    }
+    if (focusGame && !TargetPackagePolicy.isValidPackage(package)) {
       _snack('نام پکیج برنامه را درست وارد کنید؛ مثلاً com.tencent.ig');
       return;
     }
     setState(() => _saving = true);
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('target_package', package);
+      await prefs.setString(TargetPackagePolicy.prefsKey, package);
       await prefs.setBool('focus_game', focusGame);
       _snack('تنظیمات ذخیره شد');
     } catch (_) {
@@ -132,13 +156,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     activeColor: const Color(0xFF00D1B2),
                   ),
                   TextField(
+                    key: const Key('settings_target_package'),
                     controller: _pkgController,
-                    enabled: focusGame && !_saving,
+                    enabled: _licenseActive && focusGame && !_saving,
+                    readOnly: !_licenseActive,
                     textDirection: TextDirection.ltr,
                     autocorrect: false,
-                    decoration:
-                        _decoration('نام پکیج برنامه', 'com.tencent.ig'),
+                    decoration: _decoration(
+                      'نام پکیج برنامه',
+                      TargetPackagePolicy.defaultTargetPackage,
+                      locked: !_licenseActive,
+                    ),
                   ),
+                  if (!_licenseActive) _lockedPackageNotice(),
                   const SizedBox(height: 20),
                   FilledButton.icon(
                     onPressed: _saving ? null : _save,
@@ -208,10 +238,56 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  InputDecoration _decoration(String label, String hint) {
+  Widget _lockedPackageNotice() {
+    return Padding(
+      key: const Key('settings_target_package_locked'),
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.lock_outline, size: 18, color: Colors.white54),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'در نسخهٔ رایگان، DNS فقط روی com.tencent.ig اعمال می‌شود. '
+                  'برای انتخاب برنامهٔ دلخواه، لایسنس را فعال کنید.',
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                TextButton(
+                  key: const Key('settings_unlock_license'),
+                  style: TextButton.styleFrom(
+                    padding: EdgeInsets.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  onPressed: () async {
+                    await Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const LicenseScreen()),
+                    );
+                    if (!mounted) return;
+                    setState(() => _loading = true);
+                    await _init();
+                  },
+                  child: const Text('فعال‌سازی لایسنس'),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  InputDecoration _decoration(String label, String hint,
+      {bool locked = false}) {
     return InputDecoration(
       labelText: label,
       hintText: hint,
+      suffixIcon: locked
+          ? const Icon(Icons.lock_outline, size: 18, color: Colors.white38)
+          : null,
       filled: true,
       fillColor: const Color(0xFF111B2E),
       border: OutlineInputBorder(
