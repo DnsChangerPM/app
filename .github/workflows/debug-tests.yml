@@ -1,0 +1,33 @@
+name: Debug tests
+
+on:
+  push:
+    branches: ['arena/01a08818-app']
+
+jobs:
+  test-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Run tests with github reporter
+        run: flutter test --reporter=github --file-reporter=json:test_report.json
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: test_report.json
+          if-no-files-found: ignore
