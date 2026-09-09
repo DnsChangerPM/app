@@ -21,13 +21,52 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Run tests with github reporter
-        run: flutter test --reporter=github --file-reporter=json:test_report.json
+      - name: Run tests (machine output)
+        run: |
+          set +e
+          flutter test --machine > /tmp/machine.log 2>&1
+          echo "TEST_EXIT=$?" >> "$GITHUB_ENV"
 
-      - name: Upload test report
+      - name: Surface failures as annotations
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-report
-          path: test_report.json
-          if-no-files-found: ignore
+        run: |
+          python3 - <<'PY'
+          import json, re
+
+          def esc(s):
+              return s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+          tests = {}
+          errors = {}
+          for raw in open('/tmp/machine.log', encoding='utf-8', errors='replace'):
+              line = raw.strip()
+              if not line:
+                  continue
+              try:
+                  ev = json.loads(line)
+              except Exception:
+                  continue
+              t = ev.get('type')
+              if t == 'testStart':
+                  test = ev.get('test') or {}
+                  url = test.get('url') or ''
+                  path = url
+                  if path.startswith('file://'):
+                      path = path.split('file://', 1)[1]
+                      m = re.search(r'/app/(.*)', path)
+                      path = m.group(1) if m else path.rsplit('/', 1)[-1]
+                  tests[test.get('id')] = (test.get('name') or '?', path)
+              elif t == 'error':
+                  tid = ev.get('testID')
+                  errors.setdefault(tid, []).append(ev.get('error') or '')
+              elif t == 'testDone' and ev.get('result') in ('failure', 'error'):
+                  if ev.get('hidden'):
+                      continue
+                  tid = ev.get('testID')
+                  name, path = tests.get(tid, ('?', '?'))
+                  msg = errors.get(tid) or [ev.get('error') or '']
+                  text = '\n'.join(x for x in msg if x).strip()
+                  if not text:
+                      text = '(no message)'
+                  print(f"::error file={path},line=1,col=1::{esc(name + ' :: ' + text[:800])}")
+          PY
