@@ -20,7 +20,8 @@ class DnsResolver(
         val srcAddr: ByteArray,
         val srcPort: Int,
         val dstAddr: ByteArray,
-        val timestamp: Long
+        val timestamp: Long,
+        var secondarySent: Boolean = false
     )
 
     private val channel: DatagramChannel = DatagramChannel.open().apply { configureBlocking(false) }
@@ -70,15 +71,23 @@ class DnsResolver(
     }
 
     fun resolve(query: ByteArray, srcAddr: ByteArray, srcPort: Int, dstAddr: ByteArray) {
-        if (!running || query.size < 2) return
+        if (!running || query.size < 2 || upstreams.isEmpty()) return
         val id = ((query[0].toInt() and 0xFF) shl 8) or (query[1].toInt() and 0xFF)
-        if (upstreams.isEmpty()) return
-        val upstream = upstreams[Math.floorMod(idx.getAndIncrement(), upstreams.size)]
+        val upstream = upstreams[0] // Prefer primary upstream first for speed
         pending[id] = PendingQuery(id, srcAddr, srcPort, dstAddr, System.currentTimeMillis())
         try {
             channel.send(ByteBuffer.wrap(query), InetSocketAddress(upstream.first, upstream.second))
         } catch (e: Exception) {
-            pending.remove(id)
+            if (upstreams.size > 1) {
+                try {
+                    val sec = upstreams[1]
+                    channel.send(ByteBuffer.wrap(query), InetSocketAddress(sec.first, sec.second))
+                } catch (_: Exception) {
+                    pending.remove(id)
+                }
+            } else {
+                pending.remove(id)
+            }
         }
     }
 
@@ -86,7 +95,7 @@ class DnsResolver(
         val buf = ByteBuffer.allocate(65535)
         while (running) {
             try {
-                val n = selector.select(1000)
+                val n = selector.select(500)
                 if (n > 0) {
                     val it = selector.selectedKeys().iterator()
                     while (it.hasNext()) {
@@ -108,10 +117,14 @@ class DnsResolver(
                         }
                     }
                 }
+                // Cleanup stale queries older than 10 seconds
                 val now = System.currentTimeMillis()
                 val it = pending.entries.iterator()
                 while (it.hasNext()) {
-                    if (now - it.next().value.timestamp > 20_000) it.remove()
+                    val entry = it.next()
+                    if (now - entry.value.timestamp > 10_000) {
+                        it.remove()
+                    }
                 }
             } catch (_: Exception) {
                 // keep looping
