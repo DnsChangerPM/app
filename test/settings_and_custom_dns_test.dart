@@ -9,6 +9,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'support/fake_speed_tester.dart';
 import 'support/fake_vpn_platform.dart';
 
 void main() {
@@ -113,12 +114,17 @@ void main() {
   testWidgets(
       'a custom profile is selectable and sends its addresses to the VPN',
       (tester) async {
+    tester.view.physicalSize = const Size(800, 1600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     final profile = await CustomDnsService().save(
       name: 'Home DNS',
       primary: '192.168.1.1',
       secondary: '2606:4700:4700::1111',
     );
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(
+        MaterialApp(home: HomeScreen(speedTest: FakeSpeedTestService())));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Home DNS'));
     await tester.pumpAndSettle();
@@ -133,7 +139,8 @@ void main() {
   testWidgets(
       'new profiles appear on home immediately after returning from settings',
       (tester) async {
-    await tester.pumpWidget(const MaterialApp(home: HomeScreen()));
+    await tester.pumpWidget(
+        MaterialApp(home: HomeScreen(speedTest: FakeSpeedTestService())));
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Settings'));
     await tester.pumpAndSettle();

@@ -3,9 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/app_info.dart';
 import '../services/app_filter_service.dart';
-import '../services/license_service.dart';
 import '../services/target_package_policy.dart';
-import 'license_screen.dart';
 
 class AppFilterScreen extends StatefulWidget {
   const AppFilterScreen({super.key});
@@ -16,14 +14,12 @@ class AppFilterScreen extends StatefulWidget {
 
 class _AppFilterScreenState extends State<AppFilterScreen> {
   final AppFilterService _filterService = AppFilterService();
-  final LicenseService _licenseService = LicenseService();
 
   List<AppInfo> _allApps = [];
   Set<String> _selectedPackages = {};
   AppFilterMode _mode = AppFilterMode.all;
   bool _loading = true;
   bool _saving = false;
-  bool _licenseActive = false;
   String _searchQuery = '';
 
   @override
@@ -34,12 +30,10 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
 
   Future<void> _load() async {
     await _filterService.load();
-    await _licenseService.load();
     final apps = await _filterService.getInstalledApps();
 
     if (mounted) {
       setState(() {
-        _licenseActive = _licenseService.cachedInfo?.isActive ?? false;
         _allApps = apps;
         _mode = _filterService.mode;
         _selectedPackages = Set.from(_filterService.selectedPackages);

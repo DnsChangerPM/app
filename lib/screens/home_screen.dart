@@ -27,7 +27,10 @@ import 'speed_test_screen.dart';
 import 'stats_screen.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({super.key, this.speedTest});
+
+  /// Injectable for tests; defaults to the shared [DnsSpeedTestService.instance].
+  final DnsSpeedTestService? speedTest;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -37,7 +40,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final VpnServiceController _vpn = VpnServiceController();
   final LicenseService _license = LicenseService();
   final CustomDnsService _customDns = CustomDnsService();
-  final DnsSpeedTestService _speedTest = DnsSpeedTestService.instance;
+  late final DnsSpeedTestService _speedTest;
   final DnsStatsService _stats = DnsStatsService.instance;
   final DnsSettingsService _settings = DnsSettingsService.instance;
   final AppFilterService _appFilter = AppFilterService();
@@ -66,6 +69,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _speedTest = widget.speedTest ?? DnsSpeedTestService.instance;
     WidgetsBinding.instance.addObserver(this);
     _stats.init();
     _settings.load();
@@ -132,6 +136,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _statusSubscription?.cancel();
     _licenseHeartbeat?.cancel();
+    if (_status.hasSession) {
+      _stats.onVpnDisconnected();
+    }
     super.dispose();
   }
 
