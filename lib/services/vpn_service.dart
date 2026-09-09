@@ -22,12 +22,21 @@ class VpnServiceController {
 
   Stream<VpnStatus> get states => _states;
 
-  Future<void> start(List<String> addresses,
-      {int port = 53, List<String> allowedPackages = const []}) {
+  Future<void> start(
+    List<String> addresses, {
+    int port = 53,
+    List<String> allowedPackages = const [],
+    List<String> disallowedPackages = const [],
+    bool enableIpv6 = true,
+    int timeoutMs = 2500,
+  }) {
     return _command('start', {
       'addresses': addresses,
       'port': port,
       'allowedPackages': allowedPackages,
+      'disallowedPackages': disallowedPackages,
+      'enableIpv6': enableIpv6,
+      'timeoutMs': timeoutMs,
     });
   }
 
@@ -58,6 +67,24 @@ class VpnServiceController {
   Future<bool> isRunning() async => (await getStatus()).isConnected;
   Future<void> openNotificationSettings() =>
       _command('openNotificationSettings');
+
+  Future<List<Map<String, dynamic>>> getInstalledApps() async {
+    try {
+      final list = await _channel.invokeListMethod<Map<dynamic, dynamic>>('getInstalledApps');
+      if (list != null) {
+        return list.map((item) => Map<String, dynamic>.from(item)).toList();
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  Future<Map<String, dynamic>?> getNetworkInfo() async {
+    try {
+      final info = await _channel.invokeMapMethod<String, dynamic>('getNetworkInfo');
+      return info;
+    } catch (_) {}
+    return null;
+  }
 
   Future<void> _command(String method,
       [Map<String, dynamic>? arguments]) async {
