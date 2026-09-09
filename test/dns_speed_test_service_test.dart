@@ -1,4 +1,3 @@
-import 'package:dns_changer/models/dns_server.dart';
 import 'package:dns_changer/services/dns_speed_test_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 

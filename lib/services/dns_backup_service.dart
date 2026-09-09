@@ -68,7 +68,7 @@ class DnsBackupService {
       await customService.save(
         name: s.name,
         primary: primary,
-        secondary: secondary,
+        secondary: secondary ?? '',
       );
       count++;
     }
