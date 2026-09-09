@@ -10,6 +10,7 @@ import '../models/vpn_status.dart';
 import '../services/custom_dns_service.dart';
 import '../services/dns_catalog.dart';
 import '../services/license_service.dart';
+import '../services/target_package_policy.dart';
 import '../services/version_service.dart';
 import '../services/vpn_service.dart';
 import '../widgets/server_card.dart';
@@ -35,7 +36,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _loading = true;
   String selectedId = 'cloudflare';
   bool focusGame = false;
-  String targetPackage = 'com.tencent.ig';
+  String targetPackage = TargetPackagePolicy.defaultTargetPackage;
   bool get running => _status.isConnected;
   bool get busy => _commandPending || _status.isBusy;
 
@@ -107,7 +108,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     final nextServer = nextServers.firstWhere((server) => server.id == nextId);
     final nextFocus = prefs.getBool('focus_game') ?? false;
-    final nextPackage = prefs.getString('target_package') ?? 'com.tencent.ig';
+    // The single-app target is a licensed feature: free installs always fall
+    // back to the default package, whatever is stored in preferences.
+    final nextPackage = TargetPackagePolicy.resolve(
+      prefs.getString(TargetPackagePolicy.prefsKey),
+      licenseActive: _license.cachedInfo?.isActive ?? false,
+    );
     final changed = _selectedServer?.id != nextId ||
         !listEquals(_selectedServer?.addresses, nextServer.addresses) ||
         focusGame != nextFocus ||
@@ -260,8 +266,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           return;
         }
       }
+      // Re-resolve right before starting so a revoked/expired license instantly
+      // falls back to the free default package.
+      final effectivePackage = TargetPackagePolicy.resolve(
+        targetPackage,
+        licenseActive: _license.cachedInfo?.isActive ?? false,
+      );
       await _runCommand(() => _vpn.start(server.addresses,
-          allowedPackages: focusGame ? [targetPackage] : <String>[]));
+          allowedPackages: focusGame ? [effectivePackage] : <String>[]));
     }
   }
 
