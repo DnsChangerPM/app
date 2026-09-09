@@ -123,6 +123,7 @@ void main() {
         MaterialApp(home: HomeScreen(speedTest: FakeSpeedTestService())));
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.text('Home DNS'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Home DNS'));
     await tester.pumpAndSettle();
     final prefs = await SharedPreferences.getInstance();
