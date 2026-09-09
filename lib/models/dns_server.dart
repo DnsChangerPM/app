@@ -78,7 +78,7 @@ class DnsServer {
     String? id,
     String? name,
     String? description,
-    List<String> addresses,
+    List<String>? addresses,
     String? country,
     bool? isPremium,
     bool? isCustom,

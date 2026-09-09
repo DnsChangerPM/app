@@ -3,7 +3,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../models/dns_server.dart';
-import '../services/dns_speed_test_service.dart';
 import '../services/vpn_service.dart';
 
 class NetworkToolsScreen extends StatefulWidget {
@@ -25,17 +24,14 @@ class _NetworkToolsScreenState extends State<NetworkToolsScreen> {
   final TextEditingController _hostController = TextEditingController(text: 'google.com');
 
   Map<String, dynamic>? _netInfo;
-  bool _loadingNet = true;
   bool _resolving = false;
   List<String> _resolvedIps = [];
   int? _resolveLatency;
   String? _resolveError;
-  DnsServer? _testServer;
 
   @override
   void initState() {
     super.initState();
-    _testServer = widget.activeServer ?? widget.servers.firstOrNull;
     _loadNetInfo();
   }
 
@@ -44,7 +40,6 @@ class _NetworkToolsScreenState extends State<NetworkToolsScreen> {
     if (mounted) {
       setState(() {
         _netInfo = info;
-        _loadingNet = false;
       });
     }
   }
