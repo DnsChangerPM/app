@@ -215,9 +215,13 @@ object VpnCoreChecks {
             val server = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 3000 }
             val answered = CountDownLatch(1)
             var protectedSocket: DatagramSocket? = null
-            val resolver = DnsResolver(listOf("127.0.0.1" to server.localPort), { socket -> protectedSocket = socket; true }) { pending, data ->
-                if (pending.id == 0x1234 && data.size == 12) answered.countDown()
-            }
+            val resolver = DnsResolver(
+                listOf("127.0.0.1" to server.localPort),
+                { socket -> protectedSocket = socket; true },
+                onResponse = { pending, data ->
+                    if (pending.id == 0x1234 && data.size == 12) answered.countDown()
+                }
+            )
             val echo = Thread {
                 try {
                     val packet = DatagramPacket(ByteArray(512), 512)
@@ -242,7 +246,11 @@ object VpnCoreChecks {
         "failed socket protection closes resources instead of creating a DNS loop" to {
             var socket: DatagramSocket? = null
             failure("socket_protection_failed") {
-                DnsResolver(listOf("127.0.0.1" to 53), { current -> socket = current; false }) { _, _ -> }
+                DnsResolver(
+                    listOf("127.0.0.1" to 53),
+                    { current -> socket = current; false },
+                    onResponse = { _, _ -> }
+                )
             }
             check(socket?.isClosed == true)
         },
