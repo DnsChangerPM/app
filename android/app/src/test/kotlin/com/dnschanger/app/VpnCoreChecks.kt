@@ -317,6 +317,17 @@ object VpnCoreChecks {
                 3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0
             )
             check(PacketUtils.parseQuestion(withPtr)?.name == "google.com")
+            check(PacketUtils.qtypeName(1) == "A")
+            check(PacketUtils.qtypeName(28) == "AAAA")
+            check(PacketUtils.qtypeName(65) == "HTTPS")
+            check(PacketUtils.qtypeName(65400) == "TYPE65400")
+
+            val pointerLoop = byteArrayOf(
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xC0.toByte(), 12, 0, 1, 0, 1
+            )
+            check(PacketUtils.parseQuestion(pointerLoop) == null)
+            check(PacketUtils.parseQuestion(a.copyOf(a.size - 1)) == null)
         },
         "UDP failover sends to the second upstream after timeout" to {
             val silent = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 50 }
