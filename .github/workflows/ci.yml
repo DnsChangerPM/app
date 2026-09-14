@@ -55,15 +55,21 @@ jobs:
       - name: Test native VPN lifecycle
         run: |
           set +e
-          bash android/gradlew -p android testReleaseUnitTest --no-daemon
+          bash android/gradlew -p android testReleaseUnitTest --no-daemon > native-test.log 2>&1
           STATUS=$?
+          cat native-test.log
           if [ $STATUS -ne 0 ]; then
             python3 - <<'PY'
           import glob
           import xml.etree.ElementTree as ET
 
-          def escape(value):
-              return str(value).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          found = False
+          def emit(title, message):
+              global found
+              found = True
+              def escape(value):
+                  return str(value).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f"::error title={escape(title)}::{escape(message)}")
 
           for path in glob.glob('build/app/test-results/testReleaseUnitTest/*.xml'):
               root = ET.parse(path).getroot()
@@ -72,8 +78,13 @@ jobs:
                   if failure is None:
                       failure = case.find('error')
                   if failure is not None:
-                      message = failure.get('message') or (failure.text or 'Native unit test failed')
-                      print(f"::error title={escape(case.get('name', 'Native test failed'))}::{escape(message)}")
+                      emit(case.get('name', 'Native test failed'),
+                           failure.get('message') or (failure.text or 'Native unit test failed'))
+
+          if not found:
+              with open('native-test.log', errors='replace') as log:
+                  lines = log.readlines()
+              emit('Native Gradle task failed', ''.join(lines[-80:]))
           PY
             exit $STATUS
           fi
