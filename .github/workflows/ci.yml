@@ -53,7 +53,30 @@ jobs:
           fi
 
       - name: Test native VPN lifecycle
-        run: bash android/gradlew -p android testReleaseUnitTest --no-daemon
+        run: |
+          set +e
+          bash android/gradlew -p android testReleaseUnitTest --no-daemon
+          STATUS=$?
+          if [ $STATUS -ne 0 ]; then
+            python3 - <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+
+          def escape(value):
+              return str(value).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+          for path in glob.glob('build/app/test-results/testReleaseUnitTest/*.xml'):
+              root = ET.parse(path).getroot()
+              for case in root.iter('testcase'):
+                  failure = case.find('failure')
+                  if failure is None:
+                      failure = case.find('error')
+                  if failure is not None:
+                      message = failure.get('message') or (failure.text or 'Native unit test failed')
+                      print(f"::error title={escape(case.get('name', 'Native test failed'))}::{escape(message)}")
+          PY
+            exit $STATUS
+          fi
 
       - name: Test Cloudflare Worker helpers
         run: npm test
