@@ -75,6 +75,15 @@ android {
             minifyEnabled false
         }
     }
+
+    testOptions {
+        unitTests.all {
+            testLogging {
+                events "failed"
+                exceptionFormat "full"
+            }
+        }
+    }
 }
 
 flutter {
