@@ -51,6 +51,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(statusLabel(tester), 'متصل');
     expect(find.byIcon(Icons.pause), findsOneWidget);
+    // Leave the tunnel down so the session duration timer is cancelled.
+    native.setState('disconnected');
+    await tester.pumpAndSettle();
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -106,6 +109,9 @@ void main() {
         {'state': 'connecting', 'revision': 0, 'notificationsEnabled': true});
     await tester.pump();
     expect(statusLabel(tester), 'متصل');
+    // Leave the tunnel down so the session duration timer is cancelled.
+    native.setState('disconnected');
+    await tester.pumpAndSettle();
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -125,6 +131,9 @@ void main() {
     native.setState('connected', notificationsEnabled: true);
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('vpn_enable_notifications')), findsNothing);
+    // Leave the tunnel down so the session duration timer is cancelled.
+    native.setState('disconnected');
+    await tester.pumpAndSettle();
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -178,6 +187,9 @@ void main() {
     await tester.pumpAndSettle();
     final start = native.calls.singleWhere((call) => call.method == 'start');
     expect(start.arguments['addresses'], ['9.9.9.9']);
+    // Leave the tunnel down so the session duration timer is cancelled.
+    native.setState('disconnected');
+    await tester.pumpAndSettle();
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -195,6 +207,9 @@ void main() {
     final start = native.calls.singleWhere((call) => call.method == 'start');
     expect(start.arguments['allowedPackages'], containsAll(['com.a', 'com.b']));
     expect(start.arguments['autoReconnect'], isTrue);
+    // Leave the tunnel down so the session duration timer is cancelled.
+    native.setState('disconnected');
+    await tester.pumpAndSettle();
     await tester.pumpWidget(const SizedBox.shrink());
   });
 

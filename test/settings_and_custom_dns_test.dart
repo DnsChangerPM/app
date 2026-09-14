@@ -134,6 +134,9 @@ void main() {
     await tester.pumpAndSettle();
     final start = vpnCalls.singleWhere((call) => call.method == 'start');
     expect(start.arguments['addresses'], profile.addresses);
+    // Leave the tunnel down so the session duration timer is cancelled.
+    native.setState('disconnected');
+    await tester.pumpAndSettle();
   });
 
   testWidgets(
