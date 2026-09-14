@@ -154,4 +154,24 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('New personal DNS'), findsOneWidget);
   });
+
+  testWidgets('settings switch saves single/all via AppFilterService for free users',
+      (tester) async {
+    tester.view.physicalSize = const Size(800, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(const MaterialApp(home: SettingsScreen()));
+    await tester.pumpAndSettle();
+    expect(find.text('ذخیرهٔ تنظیمات'), findsOneWidget);
+    await tester.ensureVisible(find.text('اعمال DNS فقط روی یک برنامه'));
+    await tester.tap(find.text('اعمال DNS فقط روی یک برنامه'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('ذخیرهٔ تنظیمات'));
+    await tester.tap(find.text('ذخیرهٔ تنظیمات'));
+    await tester.pumpAndSettle();
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('app_filter_mode'), 'single');
+    expect(prefs.getBool('focus_game'), isTrue);
+  });
 }

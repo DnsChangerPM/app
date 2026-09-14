@@ -197,4 +197,21 @@ void main() {
     expect(start.arguments['autoReconnect'], isTrue);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('changing app filter while connected disconnects', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'app_filter_mode': 'all',
+    });
+    native.setState('connected', emit: false);
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+    expect(statusLabel(tester), 'متصل');
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('app_filter_mode', 'allowed');
+    await prefs.setStringList('app_filter_packages', ['com.a']);
+    await tester.fling(find.byType(RefreshIndicator), const Offset(0, 400), 1000);
+    await tester.pumpAndSettle();
+    expect(native.calls.any((call) => call.method == 'stop'), isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 }

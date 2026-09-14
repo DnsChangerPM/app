@@ -202,7 +202,7 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
                   ),
 
                   // Quick action buttons
-                  if (_mode != AppFilterMode.all) ...[
+                  if (_mode != AppFilterMode.all && _mode != AppFilterMode.single) ...[
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                       child: SingleChildScrollView(

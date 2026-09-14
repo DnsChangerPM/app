@@ -59,14 +59,25 @@ class DnsBackupService {
   Future<({int imported, int skipped})> importAndSave(String jsonStr) async {
     final parsed = parseImportJson(jsonStr);
     final customService = CustomDnsService();
-    var imported = 0;
+    final valid = <DnsServer>[];
     var skipped = 0;
     for (final s in parsed) {
+      if (s.addresses.isEmpty ||
+          s.name.isEmpty ||
+          CustomDnsService.addressError(s.addresses.first) != null) {
+        skipped++;
+        continue;
+      }
+      if (s.addresses.length > 1 &&
+          CustomDnsService.addressError(s.addresses[1], optional: true) != null) {
+        skipped++;
+        continue;
+      }
+      valid.add(s);
+    }
+    var imported = 0;
+    for (final s in valid) {
       try {
-        if (s.addresses.isEmpty || s.name.isEmpty) {
-          skipped++;
-          continue;
-        }
         final id = (s.id.startsWith('custom_') && s.id.length > 7) ? s.id : null;
         await customService.save(
           id: id,
