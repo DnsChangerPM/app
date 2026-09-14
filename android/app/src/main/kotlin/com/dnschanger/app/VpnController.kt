@@ -61,7 +61,11 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
                         call.argument<Number>("port")?.toInt() ?: 53,
                         call.argument<List<String>>("allowedPackages") ?: emptyList(),
                         call.argument<List<String>>("disallowedPackages") ?: emptyList(),
-                        call.argument<Boolean>("enableIpv6") ?: true
+                        call.argument<Boolean>("enableIpv6") ?: true,
+                        call.argument<Boolean>("autoReconnect") ?: true,
+                        call.argument<Number>("timeoutMs")?.toInt() ?: 2500,
+                        call.argument<Boolean>("fallbackSecondary") ?: true,
+                        call.argument<Boolean>("dnsLeakProtection") ?: true
                     )
                     if (activity.packageName in config.allowedPackages) throw VpnFailure("invalid_target")
                     begin(Request(config, false))
@@ -116,6 +120,10 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
                         )
                     }.distinctBy { it["packageName"] }
                     result.success(list)
+                }
+                "setQueryLogging" -> {
+                    DnsQueryEvents.loggingEnabled = call.argument<Boolean>("enabled") ?: false
+                    result.success(null)
                 }
                 "getNetworkInfo" -> {
                     val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -205,6 +213,10 @@ class VpnController(private val activity: Activity) : MethodChannel.MethodCallHa
             intent.putStringArrayListExtra(DnsVpnService.EXTRA_DISALLOWED_PACKAGES, ArrayList(config.disallowedPackages))
             intent.putExtra(DnsVpnService.EXTRA_ENABLE_IPV6, config.enableIpv6)
             intent.putExtra(DnsVpnService.EXTRA_PORT, 53)
+            intent.putExtra(DnsVpnService.EXTRA_AUTO_RECONNECT, config.autoReconnect)
+            intent.putExtra(DnsVpnService.EXTRA_TIMEOUT_MS, config.timeoutMs)
+            intent.putExtra(DnsVpnService.EXTRA_FALLBACK_SECONDARY, config.fallbackSecondary)
+            intent.putExtra(DnsVpnService.EXTRA_DNS_LEAK_PROTECTION, config.dnsLeakProtection)
         }
         try {
             ContextCompat.startForegroundService(activity, intent)

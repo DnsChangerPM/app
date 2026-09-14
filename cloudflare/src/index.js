@@ -70,8 +70,48 @@ async function setConfig(env, cfg) {
   return cfg;
 }
 
-function adminKeyOf(cfg, request, url) {
-  return (request.headers.get('x-admin-key') || url.searchParams.get('key') || '').trim();
+function adminKeyOf(request, url) {
+  return (request.headers.get('x-admin-key') || '').trim();
+}
+
+export function isValidDeviceId(id) {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(String(id || ''));
+}
+
+export function parseDeviceLimit(raw) {
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : 1;
+}
+
+export function escHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+export function fmtDateSafe(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toISOString().slice(0, 16).replace('T', ' ');
+}
+
+export function normalizeExpiresAt(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const t = Date.parse(value);
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+async function listAllKeys(kv, prefix) {
+  const names = [];
+  let cursor;
+  for (;;) {
+    const res = await kv.list(cursor ? { prefix, cursor } : { prefix });
+    for (const item of res.keys) names.push(item);
+    if (res.list_complete || !res.cursor) break;
+    cursor = res.cursor;
+  }
+  return names;
 }
 
 // Constant-time string comparison so the admin key can't be brute-forced by timing.
@@ -94,8 +134,8 @@ function adminKeyConfigured(cfg, env) {
   return Boolean((cfg.admin_key && String(cfg.admin_key).trim()) || (env.ADMIN_KEY && String(env.ADMIN_KEY).trim()));
 }
 
-function authorized(cfg, request, url, env) {
-  const key = adminKeyOf(cfg, request, url);
+function authorized(request, url, env, cfg) {
+  const key = adminKeyOf(request, url);
   if (!key) return false;
   if (cfg.admin_key && safeEqual(key, String(cfg.admin_key).trim())) return true;
   if (env.ADMIN_KEY && safeEqual(key, String(env.ADMIN_KEY).trim())) return true;
@@ -192,9 +232,9 @@ async function listDevices(env, key) {
 async function collectBanKeys(env, norm, legacyPrefix) {
   const prefix = 'ban:' + norm + ':';
   const lists = await Promise.all([
-    env.DEVICES_KV.list({ prefix }),
+    listAllKeys(env.DEVICES_KV, prefix).then((keys) => ({ keys })),
     legacyPrefix && legacyPrefix !== prefix
-      ? env.DEVICES_KV.list({ prefix: legacyPrefix })
+      ? listAllKeys(env.DEVICES_KV, legacyPrefix).then((keys) => ({ keys }))
       : Promise.resolve({ keys: [] }),
   ]);
   const seen = new Set();
@@ -284,9 +324,9 @@ async function unbanDevice(env, key, deviceId) {
 async function collectDeviceKeys(env, norm, legacyPrefix) {
   const normPrefix = 'device:' + norm + ':';
   const lists = await Promise.all([
-    env.DEVICES_KV.list({ prefix: normPrefix }),
+    listAllKeys(env.DEVICES_KV, normPrefix).then((keys) => ({ keys })),
     legacyPrefix && legacyPrefix !== normPrefix
-      ? env.DEVICES_KV.list({ prefix: legacyPrefix })
+      ? listAllKeys(env.DEVICES_KV, legacyPrefix).then((keys) => ({ keys }))
       : Promise.resolve({ keys: [] }),
   ]);
   const seen = new Set();
@@ -393,6 +433,9 @@ async function handleClientLicense(request, env, cors) {
   const deviceCount = devices.length;
   const deviceLimit = lic.device_limit || 0;
   const deviceId = String(body.device_id || '').trim();
+  if (deviceId && !isValidDeviceId(deviceId)) {
+    return json({ ok: false, status: 'invalid', message: 'invalid device_id' }, cors, 400);
+  }
 
   const data = {
     valid: status === 'active',
@@ -423,6 +466,18 @@ async function handleClientLicense(request, env, cors) {
   }
 
   if (action === 'check') {
+    if (deviceId) {
+      const deviceKey = 'device:' + key + ':' + deviceId;
+      const existing = await env.DEVICES_KV.get(deviceKey);
+      if (existing) {
+        try {
+          const rec = JSON.parse(existing);
+          rec.last_seen = Date.now();
+          rec.ip = (request.headers.get('cf-connecting-ip') || rec.ip || '');
+          await env.DEVICES_KV.put(deviceKey, JSON.stringify(rec));
+        } catch (_) {}
+      }
+    }
     return json({ ok: true, status: 'active', message: 'ok', data }, cors, 200);
   }
 
@@ -432,6 +487,7 @@ async function handleClientLicense(request, env, cors) {
   }
   const deviceKey = 'device:' + key + ':' + deviceId;
   const existing = await env.DEVICES_KV.get(deviceKey);
+  // Best-effort limit: concurrent activations can both pass this check (KV has no transactions).
   if (!existing && deviceLimit > 0 && deviceCount >= deviceLimit) {
     return json({
       ok: false,
@@ -547,7 +603,7 @@ async function handleAdmin(request, env, url, cors, path) {
     }, cors, 401);
   }
 
-  if (!authorized(cfg, request, url, env)) {
+  if (!authorized(request, url, env, cfg)) {
     return json({ ok: false, code: 'unauthorized', message: 'Unauthorized: missing or invalid admin key.' }, cors, 401);
   }
 
@@ -581,7 +637,7 @@ async function handleAdmin(request, env, url, cors, path) {
 
   // /api/admin/stats
   if (path === '/api/admin/stats') {
-    const licList = await env.LICENSES_KV.list({ prefix: 'license:' });
+    const licList = { keys: await listAllKeys(env.LICENSES_KV, 'license:') };
     let active = 0;
     let devices = 0;
     const seen = new Set();
@@ -601,7 +657,7 @@ async function handleAdmin(request, env, url, cors, path) {
   // /api/admin/licenses
   if (path === '/api/admin/licenses') {
     if (request.method === 'GET') {
-      const list = await env.LICENSES_KV.list({ prefix: 'license:' });
+      const list = { keys: await listAllKeys(env.LICENSES_KV, 'license:') };
       const out = [];
       const seen = new Set();
       for (const k of list.keys) {
@@ -624,7 +680,7 @@ async function handleAdmin(request, env, url, cors, path) {
       const action = body.action;
       if (action === 'create') {
         const plan_name = String(body.plan_name || 'Subscription');
-        const device_limit = Math.max(0, parseInt(body.device_limit || '1', 10) || 1);
+        const device_limit = parseDeviceLimit(body.device_limit);
         let dns_servers = body.dns_servers;
         if (typeof dns_servers === 'string') {
           dns_servers = dns_servers.split(/[,\n\s]+/).map((s) => s.trim()).filter(Boolean);
@@ -656,7 +712,10 @@ async function handleAdmin(request, env, url, cors, path) {
         if (typeof body.days === 'number' && body.days > 0) {
           lic.expires_at = new Date(Date.now() + body.days * 86400000).toISOString();
         }
-        if (typeof body.expires_at === 'string' && body.expires_at) lic.expires_at = body.expires_at;
+        if (typeof body.expires_at === 'string' && body.expires_at) {
+          const iso = normalizeExpiresAt(body.expires_at);
+          if (iso) lic.expires_at = iso;
+        }
         if (typeof body.dns_servers === 'string') {
           lic.dns_servers = body.dns_servers.split(/[,\n\s]+/).map((s) => s.trim()).filter(Boolean);
         } else if (Array.isArray(body.dns_servers)) {
@@ -711,6 +770,9 @@ async function handleAdmin(request, env, url, cors, path) {
         const body = await request.json().catch(() => ({}));
         const deviceId = String(body.device_id || '').trim();
         if (!deviceId) return json({ ok: false, message: 'device_id required.' }, cors, 400);
+        if (!isValidDeviceId(deviceId)) {
+          return json({ ok: false, status: 'invalid', message: 'invalid device_id' }, cors, 400);
+        }
         const deviceKey = 'device:' + key + ':' + deviceId;
         const existing = await env.DEVICES_KV.get(deviceKey);
         const device = {
@@ -808,7 +870,7 @@ export default {
       }
       return json({ ok: false, message: 'Not found.' }, cors, 404);
     } catch (e) {
-      return json({ ok: false, message: (e && e.message) || String(e) }, cors, 500);
+      return json({ ok: false, message: 'Internal error' }, cors, 500);
     }
   },
 };
@@ -950,7 +1012,7 @@ function adminHtml() {
         <h3>How it works</h3>
         <ol style="line-height:1.8">
           <li>Deploy this Worker to Cloudflare (free plan) with the three KV namespaces.</li>
-          <li>Set the admin key: <code>wrangler secret put ADMIN_KEY</code> (or, on first boot, the panel asks you to create one). Then open this page with <code>?key=YOUR_ADMIN_KEY</code> or paste the key on login.</li>
+          <li>Set the admin key: <code>wrangler secret put ADMIN_KEY</code> (or, on first boot, the panel asks you to create one). Then paste the key on the login form (header <code>x-admin-key</code> only; query parameters are not accepted).</li>
           <li>Create a license: set a plan, device limit, duration and the private DNS IPs (all comma-separated IPs form <b>one</b> subscription DNS profile, e.g. <code>1.1.1.1, 1.0.0.1</code>).</li>
           <li>Share the generated key with your users. They enter it in the app → the DNS is unlocked.</li>
           <li>The app never shows the real subscription DNS — only an "active" switch.</li>
@@ -1125,6 +1187,7 @@ async function boot() {
 function fmtDate(ts) {
   if (!ts) return '—';
   const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '—';
   return d.toISOString().slice(0, 16).replace('T', ' ');
 }
 
@@ -1138,12 +1201,12 @@ async function loadLicenses() {
         ? \`<button class="green" onclick="reactivateLicense('\${l.key}')">Un-ban</button>\`
         : '';
     return \`<tr>
-      <td><code>\${l.key}</code></td>
-      <td>\${l.plan_name}</td>
+      <td><code>\${esc(l.key)}</code></td>
+      <td>\${esc(l.plan_name)}</td>
       <td>\${l.device_count}/\${l.device_limit || '∞'}</td>
-      <td><span class="badge \${statusClass}">\${l.status}</span></td>
+      <td><span class="badge \${esc(statusClass)}">\${esc(l.status)}</span></td>
       <td>\${l.expires_at ? fmtDate(l.expires_at) : 'Lifetime'}</td>
-      <td class="muted">\${(l.dns_servers || []).join(', ') || '—'}</td>
+      <td class="muted">\${esc((l.dns_servers || []).join(', ') || '—')}</td>
       <td>
         \${statusAction}
         <button class="ghost" onclick="showDevices('\${l.key}')">Devices</button>
@@ -1200,23 +1263,46 @@ async function showDevices(key) {
   const data = await api('/license/' + key);
   const devs = data.data.devices || [];
   document.getElementById('devicesTitle').textContent = 'Devices of ' + key + ' (' + devs.length + '/' + (data.data.device_limit || '∞') + ')';
-  document.getElementById('devicesTable').innerHTML = devs.map(d => {
-    const idJs = JSON.stringify(d.id);
-    const badge = d.banned ? '<span class="badge banned">banned</span> ' : '';
-    const banAction = d.banned
-      ? \`<button class="green" onclick='deviceAction(\${idJs}, "unban")'>Un-ban</button>\`
-      : \`<button class="ban" onclick='deviceAction(\${idJs}, "ban")'>Ban</button>\`;
-    return \`<tr>
-      <td>\${badge}\${esc(d.name)}</td>
-      <td><code>\${esc(d.id)}</code></td>
-      <td>\${fmtDate(d.last_seen)}</td>
-      <td class="muted">\${esc(d.ip) || '—'}</td>
-      <td>
-        \${banAction}
-        <button class="ghost" onclick='removeDevice(\${idJs}, \${d.banned})'>Remove</button>
-      </td>
-    </tr>\`;
-  }).join('') || '<tr><td colspan="5" class="muted">No devices.</td></tr>';
+  const tbody = document.getElementById('devicesTable');
+  tbody.textContent = '';
+  if (!devs.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">No devices.</td></tr>';
+  } else {
+    for (const d of devs) {
+      const tr = document.createElement('tr');
+      const nameTd = document.createElement('td');
+      if (d.banned) {
+        const badge = document.createElement('span');
+        badge.className = 'badge banned';
+        badge.textContent = 'banned';
+        nameTd.appendChild(badge);
+        nameTd.appendChild(document.createTextNode(' '));
+      }
+      nameTd.appendChild(document.createTextNode(d.name || ''));
+      const idTd = document.createElement('td');
+      const code = document.createElement('code');
+      code.textContent = d.id || '';
+      idTd.appendChild(code);
+      const seenTd = document.createElement('td');
+      seenTd.textContent = fmtDate(d.last_seen);
+      const ipTd = document.createElement('td');
+      ipTd.className = 'muted';
+      ipTd.textContent = d.ip || '—';
+      const actTd = document.createElement('td');
+      const banBtn = document.createElement('button');
+      banBtn.className = d.banned ? 'green' : 'ban';
+      banBtn.textContent = d.banned ? 'Un-ban' : 'Ban';
+      banBtn.addEventListener('click', () => deviceAction(d.id, d.banned ? 'unban' : 'ban'));
+      const rmBtn = document.createElement('button');
+      rmBtn.className = 'ghost';
+      rmBtn.textContent = 'Remove';
+      rmBtn.addEventListener('click', () => removeDevice(d.id, d.banned));
+      actTd.appendChild(banBtn);
+      actTd.appendChild(rmBtn);
+      tr.appendChild(nameTd); tr.appendChild(idTd); tr.appendChild(seenTd); tr.appendChild(ipTd); tr.appendChild(actTd);
+      tbody.appendChild(tr);
+    }
+  }
   document.getElementById('devicesModal').classList.add('open');
 }
 
@@ -1257,9 +1343,20 @@ async function loadConfig() {
   document.getElementById('cfgAdminKey').value = '';
   document.getElementById('cfgToken').value = '';
   const rel = c.last_release;
-  document.getElementById('releaseBox').innerHTML = rel
-    ? \`Latest: <b>\${rel.tag_name}</b> — APK: \${rel.assets && rel.assets.length ? '<a href="' + rel.assets[0].browser_download_url + '">' + rel.assets[0].name + '</a>' : 'none'}\`
-    : 'No release found yet.';
+  const box = document.getElementById('releaseBox');
+  box.textContent = '';
+  if (!rel) { box.textContent = 'No release found yet.'; }
+  else {
+    box.appendChild(document.createTextNode('Latest: '));
+    const b = document.createElement('b'); b.textContent = rel.tag_name || ''; box.appendChild(b);
+    if (rel.assets && rel.assets.length) {
+      box.appendChild(document.createTextNode(' — APK: '));
+      const a = document.createElement('a');
+      a.href = rel.assets[0].browser_download_url || '#';
+      a.textContent = rel.assets[0].name || 'apk';
+      box.appendChild(a);
+    }
+  }
 }
 
 async function saveConfig() {
@@ -1281,7 +1378,7 @@ async function refreshRelease() {
   toast('Release refreshed');
 }
 
-document.getElementById('logoutBtn').addEventListener('click', logout);
+document.getElementById('logoutBtn').addEventListener('click', () => logout());
 boot();
 </script>
 </body>

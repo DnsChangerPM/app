@@ -4,12 +4,18 @@ import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicLong
 
 /** Process-local authoritative status. No server addresses or URLs in events. */
-data class VpnSnapshot(val phase: VpnPhase, val errorCode: String?, val revision: Long) {
+data class VpnSnapshot(
+    val phase: VpnPhase,
+    val errorCode: String?,
+    val revision: Long,
+    val connectedAt: Long? = null
+) {
     fun toMap(notificationsEnabled: Boolean): Map<String, Any?> = mapOf(
         "state" to phase.wireName,
         "errorCode" to errorCode,
         "revision" to revision,
-        "notificationsEnabled" to notificationsEnabled
+        "notificationsEnabled" to notificationsEnabled,
+        "connectedAt" to connectedAt
     )
 }
 

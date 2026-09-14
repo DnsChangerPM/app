@@ -42,4 +42,20 @@ void main() {
   test('parseImportJson throws FormatException on invalid input', () {
     expect(() => DnsBackupService.instance.parseImportJson('not json'), throwsFormatException);
   });
+
+  test('reimporting the same custom id updates instead of duplicating', () async {
+    const json = '''
+{"custom_servers":[{"id":"custom_abc","name":"Mine","addresses":["1.1.1.1"]}]}
+''';
+    final first = await DnsBackupService.instance.importAndSave(json);
+    expect(first.imported, 1);
+    final second = await DnsBackupService.instance.importAndSave(
+      '{"custom_servers":[{"id":"custom_abc","name":"Mine2","addresses":["8.8.8.8"]},{"id":"x","name":"","addresses":[]}]}',
+    );
+    expect(second.imported, 1);
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('custom_dns_servers_v1')!;
+    expect(raw.contains('Mine2'), isTrue);
+    expect('custom_abc'.allMatches(raw).length, 1);
+  });
 }

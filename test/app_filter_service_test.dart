@@ -57,4 +57,19 @@ void main() {
     expect(resolved.allowed, isEmpty);
     expect(resolved.disallowed, containsAll(['com.bank.app', 'com.bypass.app']));
   });
+
+  test('save allowed mode does not set focus_game', () async {
+    final service = AppFilterService();
+    await service.save(newMode: AppFilterMode.allowed, newPackages: {'com.a'});
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('focus_game'), isFalse);
+    expect(prefs.getString('app_filter_mode'), 'allowed');
+  });
+
+  test('save single mode sets focus_game', () async {
+    final service = AppFilterService();
+    await service.save(newMode: AppFilterMode.single);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('focus_game'), isTrue);
+  });
 }

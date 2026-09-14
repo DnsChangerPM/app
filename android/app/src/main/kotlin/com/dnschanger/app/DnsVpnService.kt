@@ -33,6 +33,10 @@ class DnsVpnService : VpnService() {
         const val EXTRA_DISALLOWED_PACKAGES = "disallowed_packages"
         const val EXTRA_ENABLE_IPV6 = "enable_ipv6"
         const val EXTRA_START_TICKET = "start_ticket"
+        const val EXTRA_AUTO_RECONNECT = "auto_reconnect"
+        const val EXTRA_TIMEOUT_MS = "timeout_ms"
+        const val EXTRA_FALLBACK_SECONDARY = "fallback_secondary"
+        const val EXTRA_DNS_LEAK_PROTECTION = "dns_leak_protection"
         private const val MTU = 1500
 
         const val VPN_IPV4 = "10.0.0.2"
@@ -104,7 +108,11 @@ class DnsVpnService : VpnService() {
                         intent.getIntExtra(EXTRA_PORT, 53),
                         intent.getStringArrayListExtra(EXTRA_ALLOWED_PACKAGES) ?: emptyList(),
                         intent.getStringArrayListExtra(EXTRA_DISALLOWED_PACKAGES) ?: emptyList(),
-                        intent.getBooleanExtra(EXTRA_ENABLE_IPV6, true)
+                        intent.getBooleanExtra(EXTRA_ENABLE_IPV6, true),
+                        intent.getBooleanExtra(EXTRA_AUTO_RECONNECT, true),
+                        intent.getIntExtra(EXTRA_TIMEOUT_MS, 2500),
+                        intent.getBooleanExtra(EXTRA_FALLBACK_SECONDARY, true),
+                        intent.getBooleanExtra(EXTRA_DNS_LEAK_PROTECTION, true)
                     )
                     session.start(config)
                 }
@@ -178,8 +186,12 @@ class DnsVpnService : VpnService() {
             }
         }
 
-        val routes = (config.upstreams.map { it.first } + EXTRA_RESOLVERS +
-            (properties?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList())).distinct()
+        val extraRoutes = if (config.dnsLeakProtection) {
+            EXTRA_RESOLVERS + (properties?.dnsServers?.mapNotNull { it.hostAddress } ?: emptyList())
+        } else {
+            emptyList()
+        }
+        val routes = (config.upstreams.map { it.first } + extraRoutes).distinct()
         for (ip in routes) {
             if (!config.enableIpv6 && ip.contains(':')) continue
             try { builder.addRoute(ip, if (ip.contains(':')) 128 else 32) } catch (_: IllegalArgumentException) { }
@@ -209,29 +221,64 @@ class DnsVpnService : VpnService() {
             throw error
         }
         tunnel = connection
-        connection.resolver = DnsResolver(config.upstreams, { protect(it) }) { pending, response ->
-            val packet = PacketUtils.buildUdpResponse(pending.dstAddr, pending.srcAddr, 53, pending.srcPort, response)
-            writeToTun(packet, connection.generation)
+        try {
+            getSharedPreferences(VpnLastConfig.PREFS, Context.MODE_PRIVATE)
+                .edit().putString(VpnLastConfig.KEY, VpnLastConfig.toJson(config)).apply()
+        } catch (_: Exception) {}
+        connection.resolver = DnsResolver(
+            config.upstreams,
+            { protect(it) },
+            { pending, response ->
+                val packet = PacketUtils.buildUdpResponse(pending.dstAddr, pending.srcAddr, 53, pending.srcPort, response)
+                writeToTun(packet, connection.generation)
+            },
+            config.timeoutMs,
+            config.fallbackSecondary
+        ) { pending, response, serverIndex ->
+            DnsQueryEvents.emit(response, serverIndex, System.currentTimeMillis() - pending.timestamp)
         }
         connection.resolver!!.start()
         connection.reader = Thread({ readTunnel(connection) }, "DnsVpnReader").also { it.start() }
-        watchNetwork(connection.generation, fingerprint)
+        if (config.autoReconnect) {
+            watchNetwork(connection.generation, fingerprint)
+        }
     }
 
     private fun readTunnel(connection: Tunnel) {
         val packet = ByteArray(32767)
+        var lastSweep = System.currentTimeMillis()
         try {
             while (isCurrent(connection.generation) && !Thread.currentThread().isInterrupted) {
                 val length = connection.input.read(packet)
                 if (length < 0) break
                 if (length == 0 || !isCurrent(connection.generation)) continue
+                val now = System.currentTimeMillis()
+                if (now - lastSweep > 30_000) {
+                    lastSweep = now
+                    for (entry in connection.tcp.entries) {
+                        if (entry.value.isIdle(60_000)) {
+                            if (connection.tcp.remove(entry.key, entry.value)) {
+                                entry.value.close()
+                            }
+                        }
+                    }
+                }
                 val parsed = PacketUtils.parse(packet, length) ?: continue
-                if (parsed.dstPort != 53) continue
+                if (parsed.dstPort != 53) {
+                    if (parsed.protocol == PacketUtils.PROTO_TCP && (parsed.tcpFlags and TcpProxy.SYN) != 0) {
+                        val rst = PacketUtils.buildTcpResponse(
+                            parsed.dstAddr, parsed.srcAddr, parsed.dstPort, parsed.srcPort,
+                            0, 0, TcpProxy.RST or TcpProxy.ACK, ByteArray(0)
+                        )
+                        writeToTun(rst, connection.generation)
+                    }
+                    continue
+                }
                 when (parsed.protocol) {
                     PacketUtils.PROTO_UDP -> {
                         val offset = parsed.transportOffset + 8
                         if (length < offset + 12) continue
-                        connection.resolver?.resolve(packet.copyOfRange(offset, length), parsed.srcAddr, parsed.srcPort, parsed.dstAddr)
+                        connection.resolver?.resolve(packet, offset, length - offset, parsed.srcAddr, parsed.srcPort, parsed.dstAddr)
                     }
                     PacketUtils.PROTO_TCP -> {
                         val key = "${parsed.srcAddr.joinToString(":")}|${parsed.srcPort}|${parsed.dstAddr.joinToString(":")}"
@@ -239,7 +286,11 @@ class DnsVpnService : VpnService() {
                             TcpProxy(parsed.srcAddr, parsed.srcPort, parsed.dstAddr, connection.config.upstreams,
                                 { protect(it) },
                                 { writeToTun(it, connection.generation) },
-                                { closed -> connection.tcp.remove(key, closed); closed.close() })
+                                { closed -> connection.tcp.remove(key, closed); closed.close() },
+                                connection.config.fallbackSecondary
+                            ) { response, serverIndex, latency ->
+                                DnsQueryEvents.emit(response, serverIndex, latency)
+                            }
                         }
                         if (!isCurrent(connection.generation)) {
                             connection.tcp.remove(key, proxy)

@@ -79,7 +79,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
   Future<void> _activate() async {
     final key = _keyController.text.trim();
     if (key.isEmpty) {
-      _snack('Enter your license key');
+      _snack('کلید لایسنس را وارد کنید');
       return;
     }
     setState(() => loading = true);
@@ -98,7 +98,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
         }
       });
       _snack(result.message ??
-          (result.isActive ? 'Activated!' : 'Activation failed'));
+          (result.isActive ? 'فعال شد' : 'فعال‌سازی ناموفق بود'));
     } catch (_) {
       // Network exceptions can contain the private API URL; never show them.
       _snack('ارتباط با سرویس برقرار نشد؛ دوباره تلاش کنید.');
@@ -121,7 +121,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
       // even if the previous activation failed for another reason.
       if (health.ok) lastError = null;
     });
-    _snack(health.ok ? 'Server appears to be online' : 'Server check failed');
+    _snack(health.ok ? 'سرور در دسترس است' : 'بررسی سرور ناموفق بود');
   }
 
   Future<void> _deactivate() async {
@@ -133,7 +133,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
       serverCheckResult = null;
       _keyController.clear();
     });
-    _snack('License removed');
+    _snack('لایسنس حذف شد');
   }
 
   @override
@@ -151,7 +151,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
   Widget build(BuildContext context) {
     final active = info?.isActive ?? false;
     return Scaffold(
-      appBar: AppBar(title: const Text('Subscription')),
+      appBar: AppBar(title: const Text('اشتراک')),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
@@ -163,13 +163,13 @@ class _LicenseScreenState extends State<LicenseScreen> {
                 size: 64, color: Color(0xFF00D1B2)),
             const SizedBox(height: 12),
             const Text(
-              'Enter your license key',
+              'کلید لایسنس را وارد کنید',
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 6),
             const Text(
-              'Your private DNS servers are locked until you activate a valid subscription.',
+              'سرورهای اختصاصی تا فعال‌سازی اشتراک معتبر قفل هستند.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.white54, height: 1.4),
             ),
@@ -179,7 +179,7 @@ class _LicenseScreenState extends State<LicenseScreen> {
             controller: _keyController,
             obscureText: false,
             decoration: InputDecoration(
-              labelText: 'License key',
+              labelText: 'کلید لایسنس',
               hintText: 'XXXX-XXXX-XXXX-XXXX',
               filled: true,
               fillColor: const Color(0xFF111B2E),
@@ -209,14 +209,14 @@ class _LicenseScreenState extends State<LicenseScreen> {
                         strokeWidth: 2, color: Colors.black),
                   )
                 : const Icon(Icons.check_circle_outline),
-            label: Text(active ? 'Refresh' : 'Activate'),
+            label: Text(active ? 'بروزرسانی' : 'فعال‌سازی'),
           ),
           if (active) ...[
             const SizedBox(height: 12),
             TextButton.icon(
               onPressed: _deactivate,
               icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
-              label: const Text('Remove license',
+              label: const Text('حذف لایسنس',
                   style: TextStyle(color: Colors.redAccent)),
             ),
           ] else if (_serverRelatedFailure) ...[

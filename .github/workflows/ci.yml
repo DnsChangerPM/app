@@ -54,3 +54,7 @@ jobs:
 
       - name: Test native VPN lifecycle
         run: bash android/gradlew -p android testReleaseUnitTest --no-daemon
+
+      - name: Test Cloudflare Worker helpers
+        run: npm test
+        working-directory: cloudflare

@@ -3,7 +3,9 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../models/app_info.dart';
 import '../services/app_config.dart';
+import '../services/app_filter_service.dart';
 import '../services/dns_catalog.dart';
 import '../services/dns_settings_service.dart';
 import '../services/license_service.dart';
@@ -28,6 +30,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final TextEditingController _pkgController = TextEditingController();
   final DnsSettingsService _dnsSettings = DnsSettingsService.instance;
   final LicenseService _license = LicenseService();
+  final AppFilterService _appFilter = AppFilterService();
 
   bool focusGame = false;
   bool _loading = true;
@@ -46,18 +49,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final prefs = await SharedPreferences.getInstance();
     await _license.load();
     await _dnsSettings.load();
+    await _appFilter.load();
 
     if (!mounted) return;
     _licenseActive = _license.cachedInfo?.isActive ?? false;
+    final stored = prefs.getString(TargetPackagePolicy.prefsKey);
     final resolved = TargetPackagePolicy.resolve(
-      prefs.getString(TargetPackagePolicy.prefsKey),
+      stored,
       licenseActive: _licenseActive,
     );
     _pkgController.text = resolved;
-    if (prefs.getString(TargetPackagePolicy.prefsKey) != resolved) {
-      await prefs.setString(TargetPackagePolicy.prefsKey, resolved);
-    }
-    focusGame = prefs.getBool('focus_game') ?? false;
+    focusGame = _appFilter.mode == AppFilterMode.single;
     try {
       final info = await PackageInfo.fromPlatform();
       version = '${info.version} (${info.buildNumber})';
@@ -90,8 +92,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _saving = true);
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(TargetPackagePolicy.prefsKey, package);
-      await prefs.setBool('focus_game', focusGame);
+      if (_licenseActive) {
+        await prefs.setString(TargetPackagePolicy.prefsKey, package);
+      }
+      await _appFilter.save(
+        newMode: focusGame ? AppFilterMode.single : AppFilterMode.all,
+      );
       _snack('تنظیمات ذخیره شد');
     } catch (_) {
       _snack('ذخیره انجام نشد؛ دوباره تلاش کنید.');
@@ -241,7 +247,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (!_licenseActive) _lockedPackageNotice(),
                   const SizedBox(height: 12),
                   FilledButton.icon(
-                    onPressed: (!_licenseActive || _saving) ? null : _save,
+                    onPressed: _saving ? null : _save,
                     icon: const Icon(Icons.save_outlined),
                     label: Text(_saving ? 'در حال ذخیره…' : 'ذخیرهٔ تنظیمات'),
                   ),

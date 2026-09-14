@@ -203,7 +203,7 @@ object VpnCoreChecks {
                 VpnRuntime.publish(VpnPhase.CONNECTED)
                 val data = VpnRuntime.snapshot.toMap(false)
                 check(VpnRuntime.snapshot.revision > previous && received == 1)
-                check(data.keys == setOf("state", "errorCode", "revision", "notificationsEnabled"))
+                check(data.keys == setOf("state", "errorCode", "revision", "notificationsEnabled", "connectedAt"))
                 check(data["notificationsEnabled"] == false)
             } finally {
                 VpnRuntime.removeListener(detached)
@@ -245,6 +245,109 @@ object VpnCoreChecks {
                 DnsResolver(listOf("127.0.0.1" to 53), { current -> socket = current; false }) { _, _ -> }
             }
             check(socket?.isClosed == true)
+        },
+        "IPv6 UDP builder writes a 40-byte header and a valid UDP checksum" to {
+            val src = ByteArray(16) { 0 }.also { it[15] = 1 }
+            val dst = ByteArray(16) { 0 }.also { it[15] = 2 }
+            val payload = byteArrayOf(1, 2, 3, 4)
+            val packet = PacketUtils.buildUdpResponse(src, dst, 53, 12345, payload)
+            check(packet[0] == 0x60.toByte())
+            val plen = ((packet[4].toInt() and 0xFF) shl 8) or (packet[5].toInt() and 0xFF)
+            check(plen == 8 + payload.size)
+            check(packet[6] == 17.toByte())
+            check(packet[7] == 64.toByte())
+            check(packet.copyOfRange(8, 24).contentEquals(src))
+            check(packet.copyOfRange(24, 40).contentEquals(dst))
+            val srcPort = ((packet[40].toInt() and 0xFF) shl 8) or (packet[41].toInt() and 0xFF)
+            val dstPort = ((packet[42].toInt() and 0xFF) shl 8) or (packet[43].toInt() and 0xFF)
+            check(srcPort == 53 && dstPort == 12345)
+            val pseudo = java.nio.ByteBuffer.allocate(40)
+            pseudo.put(src); pseudo.put(dst); pseudo.putInt(8 + payload.size); pseudo.putInt(17)
+            val udp = packet.copyOfRange(40, packet.size)
+            check(PacketUtils.checksumConcat(pseudo.array(), udp) == 0)
+        },
+        "IPv6 TCP builder places ports at byte 40 and next-header 6" to {
+            val src = ByteArray(16) { 0 }.also { it[15] = 1 }
+            val dst = ByteArray(16) { 0 }.also { it[15] = 2 }
+            val packet = PacketUtils.buildTcpResponse(src, dst, 53, 443, 1, 2, TcpProxy.SYN or TcpProxy.ACK, ByteArray(0))
+            check(packet[0] == 0x60.toByte())
+            check(packet[6] == 6.toByte())
+            check(packet[7] == 64.toByte())
+            val srcPort = ((packet[40].toInt() and 0xFF) shl 8) or (packet[41].toInt() and 0xFF)
+            val dstPort = ((packet[42].toInt() and 0xFF) shl 8) or (packet[43].toInt() and 0xFF)
+            check(srcPort == 53 && dstPort == 443)
+            val tcpLen = packet.size - 40
+            val plen = ((packet[4].toInt() and 0xFF) shl 8) or (packet[5].toInt() and 0xFF)
+            check(plen == tcpLen)
+            val pseudo = java.nio.ByteBuffer.allocate(40)
+            pseudo.put(src); pseudo.put(dst); pseudo.putInt(tcpLen); pseudo.putInt(6)
+            val tcp = packet.copyOfRange(40, packet.size)
+            check(PacketUtils.checksumConcat(pseudo.array(), tcp) == 0)
+        },
+        "reconnect is scheduled only when both session and runtime are connected" to {
+            check(!VpnLastConfig.shouldScheduleReconnect(true, VpnPhase.CONNECTED, VpnPhase.CONNECTED, false))
+            check(VpnLastConfig.shouldScheduleReconnect(true, VpnPhase.CONNECTED, VpnPhase.CONNECTED, true))
+            check(!VpnLastConfig.shouldScheduleReconnect(true, VpnPhase.CONNECTED, VpnPhase.PAUSED, true))
+            check(!VpnLastConfig.shouldScheduleReconnect(false, VpnPhase.CONNECTED, VpnPhase.CONNECTED, true))
+            check(!VpnLastConfig.shouldScheduleReconnect(true, VpnPhase.PAUSED, VpnPhase.CONNECTED, true))
+        },
+        "last VPN config serializes and restores" to {
+            val config = VpnConfig.parse(listOf("1.1.1.1:53", "[2606:4700:4700::1111]:53"), 53, listOf("com.a"), listOf("com.b"), false, false, 3000, false, false)
+            val restored = VpnLastConfig.fromJson(VpnLastConfig.toJson(config))
+            check(restored == config)
+            check(VpnLastConfig.fromJson("not-json") == null)
+        },
+        "parseQuestion handles A AAAA truncated and compression" to {
+            val a = byteArrayOf(
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                6, 'g'.code.toByte(), 'o'.code.toByte(), 'o'.code.toByte(), 'g'.code.toByte(), 'l'.code.toByte(), 'e'.code.toByte(),
+                3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0,
+                0, 1, 0, 1
+            )
+            val qa = PacketUtils.parseQuestion(a)!!
+            check(qa.name == "google.com" && qa.qtype == 1)
+            val aaaa = a.copyOf().also { it[it.size - 3] = 28 }
+            check(PacketUtils.parseQuestion(aaaa)!!.qtype == 28)
+            check(PacketUtils.parseQuestion(byteArrayOf(1, 2, 3)) == null)
+            val withPtr = byteArrayOf(
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xC0.toByte(), 18,
+                0, 1, 0, 1,
+                6, 'g'.code.toByte(), 'o'.code.toByte(), 'o'.code.toByte(), 'g'.code.toByte(), 'l'.code.toByte(), 'e'.code.toByte(),
+                3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0
+            )
+            check(PacketUtils.parseQuestion(withPtr)?.name == "google.com")
+        },
+        "UDP failover sends to the second upstream after timeout" to {
+            val silent = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 50 }
+            val server = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 4000 }
+            val answered = CountDownLatch(1)
+            val resolver = DnsResolver(
+                listOf("127.0.0.1" to silent.localPort, "127.0.0.1" to server.localPort),
+                { true },
+                { _, data -> if (data.size >= 2) answered.countDown() },
+                600,
+                true
+            )
+            val echo = Thread {
+                try {
+                    val packet = DatagramPacket(ByteArray(512), 512)
+                    server.receive(packet)
+                    server.send(packet)
+                } catch (_: Exception) { }
+            }
+            try {
+                resolver.start()
+                echo.start()
+                val query = ByteArray(12).apply { this[0] = 0x12; this[1] = 0x34 }
+                resolver.resolve(query, byteArrayOf(10, 0, 0, 2), 12345, byteArrayOf(10, 0, 0, 1))
+                check(answered.await(4, TimeUnit.SECONDS)) { "Failover did not answer" }
+            } finally {
+                resolver.stop()
+                silent.close()
+                server.close()
+                echo.join(1000)
+            }
         }
     )
 

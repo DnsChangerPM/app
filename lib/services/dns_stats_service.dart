@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'vpn_service.dart';
 
 class DnsQueryLogEntry {
   final String id;
@@ -37,6 +40,8 @@ class DnsStatsService extends ChangeNotifier {
 
   static const String keyLoggingEnabled = 'dns_logging_enabled';
   static const String keyAllTimeQueries = 'all_time_queries_count';
+  static const EventChannel _queryEvents =
+      EventChannel('com.dnschanger.app/dns_queries');
 
   bool _loggingEnabled = true;
   int _sessionQueries = 0;
@@ -44,6 +49,8 @@ class DnsStatsService extends ChangeNotifier {
   DateTime? _sessionStartTime;
   Timer? _durationTimer;
   Duration _sessionDuration = Duration.zero;
+  StreamSubscription? _querySub;
+  final VpnServiceController _vpn = VpnServiceController();
 
   final List<DnsQueryLogEntry> _recentLogs = [];
   static const int maxLogs = 200;
@@ -58,20 +65,47 @@ class DnsStatsService extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     _loggingEnabled = prefs.getBool(keyLoggingEnabled) ?? true;
     _allTimeQueries = prefs.getInt(keyAllTimeQueries) ?? 0;
+    _querySub ??= _queryEvents.receiveBroadcastStream().listen(
+      (event) {
+        if (event is Map) {
+          handleNativeQuery(Map<dynamic, dynamic>.from(event));
+        }
+      },
+      onError: (_) {},
+    );
+    try {
+      await _vpn.setQueryLogging(_loggingEnabled);
+    } catch (_) {}
     notifyListeners();
+  }
+
+  @visibleForTesting
+  void handleNativeQuery(Map<dynamic, dynamic> event) {
+    if (!_loggingEnabled) return;
+    recordQuery(
+      domain: (event['domain'] as String?) ?? '',
+      queryType: (event['qtype'] as String?) ?? 'A',
+      serverName: 'upstream ${event['serverIndex'] ?? 0}',
+      latencyMs: (event['latencyMs'] as num?)?.toInt() ?? 0,
+    );
   }
 
   Future<void> setLoggingEnabled(bool enabled) async {
     _loggingEnabled = enabled;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(keyLoggingEnabled, enabled);
+    try {
+      await _vpn.setQueryLogging(enabled);
+    } catch (_) {}
     notifyListeners();
   }
 
-  void onVpnConnected() {
-    _sessionStartTime = DateTime.now();
+  void onVpnConnected({int? connectedAtMillis}) {
+    _sessionStartTime = connectedAtMillis != null
+        ? DateTime.fromMillisecondsSinceEpoch(connectedAtMillis)
+        : DateTime.now();
     _sessionQueries = 0;
-    _sessionDuration = Duration.zero;
+    _sessionDuration = DateTime.now().difference(_sessionStartTime!);
     _durationTimer?.cancel();
     _durationTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_sessionStartTime != null) {

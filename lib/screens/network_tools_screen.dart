@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../models/dns_server.dart';
+import '../services/dns_speed_test_service.dart';
 import '../services/vpn_service.dart';
 
 class NetworkToolsScreen extends StatefulWidget {
@@ -28,6 +28,7 @@ class _NetworkToolsScreenState extends State<NetworkToolsScreen> {
   List<String> _resolvedIps = [];
   int? _resolveLatency;
   String? _resolveError;
+  String? _answeredBy;
 
   @override
   void initState() {
@@ -53,18 +54,30 @@ class _NetworkToolsScreenState extends State<NetworkToolsScreen> {
       _resolveError = null;
       _resolvedIps = [];
       _resolveLatency = null;
+      _answeredBy = null;
     });
 
-    final stopwatch = Stopwatch()..start();
-
     try {
-      final results = await InternetAddress.lookup(host);
-      stopwatch.stop();
+      final server = widget.activeServer ??
+          (widget.servers.isNotEmpty ? widget.servers.first : null);
+      if (server == null) {
+        setState(() {
+          _resolving = false;
+          _resolveError = 'ابتدا یک سرور DNS انتخاب کنید.';
+        });
+        return;
+      }
+      final result = await DnsSpeedTestService.instance.lookupHost(host, server);
       if (mounted) {
         setState(() {
           _resolving = false;
-          _resolveLatency = stopwatch.elapsedMilliseconds;
-          _resolvedIps = results.map((r) => r.address).toList();
+          if (result == null || result.ips.isEmpty) {
+            _resolveError = 'استعلام ناموفق بود؛ دامنه یا سرور DNS را بررسی کنید.';
+          } else {
+            _resolveLatency = result.latencyMs;
+            _resolvedIps = result.ips;
+            _answeredBy = result.serverName;
+          }
         });
       }
     } catch (e) {
@@ -191,6 +204,11 @@ class _NetworkToolsScreenState extends State<NetworkToolsScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    if (_answeredBy != null) ...[
+                      Text('پاسخ از: $_answeredBy',
+                          style: const TextStyle(color: Colors.white70)),
+                      const SizedBox(height: 8),
+                    ],
                     if (_resolveLatency != null)
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,

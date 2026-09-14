@@ -43,7 +43,7 @@ class AppFilterService {
       mode = newMode;
       await prefs.setString(keyFilterMode, newMode.name);
       // Sync legacy key
-      await prefs.setBool('focus_game', newMode == AppFilterMode.single || newMode == AppFilterMode.allowed);
+      await prefs.setBool('focus_game', newMode == AppFilterMode.single);
     }
     if (newPackages != null) {
       selectedPackages = newPackages;

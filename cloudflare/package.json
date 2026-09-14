@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "description": "Cloudflare Worker: license + release + admin panel for DNS Changer",
+  "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "test": "node --test test/index.test.js"
   },
   "devDependencies": {
     "wrangler": "^3.60.0"

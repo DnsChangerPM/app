@@ -180,4 +180,21 @@ void main() {
     expect(start.arguments['addresses'], ['9.9.9.9']);
     await tester.pumpWidget(const SizedBox.shrink());
   });
+
+  testWidgets('allowed filter is not overridden by leftover focus_game',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'focus_game': true,
+      'app_filter_mode': 'allowed',
+      'app_filter_packages': ['com.a', 'com.b'],
+    });
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(toggle));
+    await tester.pumpAndSettle();
+    final start = native.calls.singleWhere((call) => call.method == 'start');
+    expect(start.arguments['allowedPackages'], containsAll(['com.a', 'com.b']));
+    expect(start.arguments['autoReconnect'], isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 }

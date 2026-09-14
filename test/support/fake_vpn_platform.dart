@@ -40,6 +40,7 @@ class FakeVpnPlatform {
           setState('disconnected');
           break;
         case 'openNotificationSettings':
+        case 'setQueryLogging':
           break;
         default:
           throw MissingPluginException();
