@@ -28,4 +28,24 @@ void main() {
     expect(stats.recentLogs.first.serverName, 'Cloudflare');
     expect(stats.recentLogs.first.latencyMs, 18);
   });
+
+  test('native events increment counters and loggingEnabled=false suppresses log', () async {
+    final stats = DnsStatsService.instance;
+    await stats.init();
+    stats.clearLogs();
+    stats.handleNativeQuery({
+      'domain': 'example.com',
+      'qtype': 'A',
+      'serverIndex': 0,
+      'latencyMs': 12,
+    });
+    expect(stats.sessionQueries, 1);
+    expect(stats.recentLogs.first.domain, 'example.com');
+
+    await stats.setLoggingEnabled(false);
+    final before = stats.recentLogs.length;
+    stats.handleNativeQuery({'domain': 'hidden.test', 'qtype': 'AAAA', 'serverIndex': 1, 'latencyMs': 9});
+    expect(stats.recentLogs.length, before);
+    await stats.setLoggingEnabled(true);
+  });
 }

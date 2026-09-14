@@ -56,22 +56,43 @@ class DnsBackupService {
   }
 
   /// Import profiles and save them to storage via CustomDnsService
-  Future<int> importAndSave(String jsonStr) async {
+  Future<({int imported, int skipped})> importAndSave(String jsonStr) async {
     final parsed = parseImportJson(jsonStr);
-    if (parsed.isEmpty) throw const FormatException('هیچ دی‌ان‌اس معتبری در متن ورودی یافت نشد.');
-
     final customService = CustomDnsService();
-    int count = 0;
+    final valid = <DnsServer>[];
+    var skipped = 0;
     for (final s in parsed) {
-      final primary = s.addresses.first;
-      final secondary = s.addresses.length > 1 ? s.addresses[1] : null;
-      await customService.save(
-        name: s.name,
-        primary: primary,
-        secondary: secondary ?? '',
-      );
-      count++;
+      if (s.addresses.isEmpty ||
+          s.name.isEmpty ||
+          CustomDnsService.addressError(s.addresses.first) != null) {
+        skipped++;
+        continue;
+      }
+      if (s.addresses.length > 1 &&
+          CustomDnsService.addressError(s.addresses[1], optional: true) != null) {
+        skipped++;
+        continue;
+      }
+      valid.add(s);
     }
-    return count;
+    var imported = 0;
+    for (final s in valid) {
+      try {
+        final id = (s.id.startsWith('custom_') && s.id.length > 7) ? s.id : null;
+        await customService.save(
+          id: id,
+          name: s.name,
+          primary: s.addresses.first,
+          secondary: s.addresses.length > 1 ? s.addresses[1] : '',
+        );
+        imported++;
+      } catch (_) {
+        skipped++;
+      }
+    }
+    if (imported == 0) {
+      throw const FormatException('هیچ دی‌ان‌اس معتبری در متن ورودی یافت نشد.');
+    }
+    return (imported: imported, skipped: skipped);
   }
 }

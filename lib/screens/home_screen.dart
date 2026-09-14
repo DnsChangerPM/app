@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/app_info.dart';
 import '../models/dns_server.dart';
 import '../models/license_info.dart';
 import '../models/vpn_status.dart';
@@ -92,7 +93,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final isNowConnected = status.isConnected;
 
     if (!wasConnected && isNowConnected) {
-      _stats.onVpnConnected();
+      _stats.onVpnConnected(connectedAtMillis: status.connectedAt);
       _measureActivePing();
     } else if (wasConnected && !isNowConnected) {
       _stats.onVpnDisconnected();
@@ -136,14 +137,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _statusSubscription?.cancel();
     _licenseHeartbeat?.cancel();
-    if (_status.hasSession) {
-      _stats.onVpnDisconnected();
-    }
     super.dispose();
   }
 
   Future<void> _loadLocalState() async {
     await _license.load();
+    final prevMode = _appFilter.mode;
+    final prevPackages = (_appFilter.selectedPackages.toList()..sort()).join(',');
     await _appFilter.load();
     final prefs = await SharedPreferences.getInstance();
     final custom = await _customDns.load();
@@ -155,7 +155,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       nextId = 'cloudflare';
     }
     final nextServer = nextServers.firstWhere((server) => server.id == nextId);
-    final nextFocus = prefs.getBool('focus_game') ?? false;
+    final nextFocus = _appFilter.mode == AppFilterMode.single;
     final nextPackage = TargetPackagePolicy.resolve(
       prefs.getString(TargetPackagePolicy.prefsKey),
       licenseActive: _license.cachedInfo?.isActive ?? false,
@@ -163,7 +163,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final changed = _selectedServer?.id != nextId ||
         !listEquals(_selectedServer?.addresses, nextServer.addresses) ||
         focusGame != nextFocus ||
-        targetPackage != nextPackage;
+        targetPackage != nextPackage ||
+        prevMode != _appFilter.mode ||
+        prevPackages != (_appFilter.selectedPackages.toList()..sort()).join(',');
 
     if (!_loading && _status.hasSession && changed) {
       if (!await _disconnectForChange()) return;
@@ -299,8 +301,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     final best = await _speedTest.findFastest(servers.where((s) => !s.isPremium || (licenseInfo?.isActive ?? false)).toList());
-    if (best != null && mounted) {
+    if (!mounted) return;
+    if (best != null) {
       await _selectServer(best);
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('سریع‌ترین سرور (${best.name}) انتخاب شد.')),
       );
@@ -343,21 +347,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         singleTargetPackage: targetPackage,
       );
 
-      final effectivePackages = focusGame
-          ? [
-              TargetPackagePolicy.resolve(
-                targetPackage,
-                licenseActive: _license.cachedInfo?.isActive ?? false,
-              )
-            ]
-          : filterScope.allowed;
-
       await _runCommand(() => _vpn.start(
             server.addresses,
-            allowedPackages: effectivePackages,
+            allowedPackages: filterScope.allowed,
             disallowedPackages: filterScope.disallowed,
             enableIpv6: _settings.enableIpv6,
             timeoutMs: _settings.queryTimeoutMs,
+            autoReconnect: _settings.autoReconnect,
+            fallbackSecondary: _settings.fallbackSecondary,
+            dnsLeakProtection: _settings.dnsLeakProtection,
           ));
     }
   }
@@ -456,7 +454,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     OutlinedButton.icon(
                       onPressed: _openLicense,
                       icon: const Icon(Icons.workspace_premium),
-                      label: const Text('Activate subscription'),
+                      label: const Text('فعال‌سازی اشتراک'),
                     ),
                     const SizedBox(height: 32),
                   ],
@@ -581,7 +579,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       children: [
         Row(
           children: [
-            Expanded(child: _sectionTitle('DNS Servers')),
+            Expanded(child: _sectionTitle('سرورهای DNS')),
             TextButton.icon(
               onPressed: _openCustomDns,
               icon: const Icon(Icons.add, size: 18),

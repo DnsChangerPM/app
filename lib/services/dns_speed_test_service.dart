@@ -15,8 +15,7 @@ class DnsSpeedTestService {
   bool get isTesting => _isTesting;
   Map<String, int?> get cachedPings => Map.unmodifiable(_cachedPings);
 
-  /// DNS Query for `google.com` (Type A, Class IN)
-  static Uint8List _buildQueryPacket(int queryId) {
+  static Uint8List buildQueryPacket(String host, {int queryId = 0, int qtype = 1}) {
     final builder = BytesBuilder();
     // Header
     builder.addByte((queryId >> 8) & 0xFF);
@@ -32,17 +31,15 @@ class DnsSpeedTestService {
     builder.addByte(0x00); // ARCOUNT = 0
     builder.addByte(0x00);
 
-    // QNAME: 6google3com0
-    final labels = ['google', 'com'];
+    final labels = host.split('.').where((l) => l.isNotEmpty);
     for (final label in labels) {
       builder.addByte(label.length);
       builder.add(label.codeUnits);
     }
     builder.addByte(0x00); // end of name
 
-    // QTYPE: A (0x0001)
-    builder.addByte(0x00);
-    builder.addByte(0x01);
+    builder.addByte((qtype >> 8) & 0xFF);
+    builder.addByte(qtype & 0xFF);
 
     // QCLASS: IN (0x0001)
     builder.addByte(0x00);
@@ -69,7 +66,7 @@ class DnsSpeedTestService {
     // Try UDP DNS lookup first
     try {
       final queryId = Random().nextInt(0xFFFF);
-      final packet = _buildQueryPacket(queryId);
+      final packet = buildQueryPacket('google.com', queryId: queryId);
 
       final socket = await RawDatagramSocket.bind(
         ip.type == InternetAddressType.IPv6 ? InternetAddress.anyIPv6 : InternetAddress.anyIPv4,
@@ -175,7 +172,7 @@ class DnsSpeedTestService {
 
     for (final s in servers) {
       final ping = _cachedPings[s.id];
-      if (ping != null && ping > 0 && ping < minPing) {
+      if (ping != null && ping >= 0 && ping < minPing) {
         minPing = ping;
         best = s.copyWith(pingMs: ping);
       }
@@ -186,5 +183,126 @@ class DnsSpeedTestService {
 
   void clearCache() {
     _cachedPings.clear();
+  }
+
+  /// Direct A+AAAA lookup against [server] (UDP then TCP), bypassing the system resolver.
+  Future<({List<String> ips, int latencyMs, String serverName})?> lookupHost(
+    String host,
+    DnsServer server, {
+    Duration timeout = const Duration(milliseconds: 2500),
+  }) async {
+    if (server.addresses.isEmpty) return null;
+    final stopwatch = Stopwatch()..start();
+    for (final address in server.addresses) {
+      final a = await _queryType(host, address, 1, timeout);
+      final aaaa = await _queryType(host, address, 28, timeout);
+      final ips = [...?a, ...?aaaa];
+      if (ips.isNotEmpty) {
+        stopwatch.stop();
+        return (ips: ips, latencyMs: stopwatch.elapsedMilliseconds, serverName: server.name);
+      }
+    }
+    return null;
+  }
+
+  Future<List<String>?> _queryType(String host, String address, int qtype, Duration timeout) async {
+    final cleanIp = address.contains(':') && !address.startsWith('[') && address.split(':').length == 2
+        ? address.split(':').first
+        : address.replaceAll('[', '').replaceAll(']', '');
+    final targetPort = address.contains(':') && address.split(':').length == 2
+        ? (int.tryParse(address.split(':').last) ?? 53)
+        : 53;
+    final ip = InternetAddress.tryParse(cleanIp);
+    if (ip == null) return null;
+    final queryId = Random().nextInt(0xFFFF);
+    final packet = buildQueryPacket(host, queryId: queryId, qtype: qtype);
+    try {
+      final socket = await RawDatagramSocket.bind(
+        ip.type == InternetAddressType.IPv6 ? InternetAddress.anyIPv6 : InternetAddress.anyIPv4,
+        0,
+      );
+      final completer = Completer<List<String>?>();
+      socket.listen((event) {
+        if (event == RawSocketEvent.read) {
+          final datagram = socket.receive();
+          if (datagram != null && datagram.data.length >= 12) {
+            final respId = (datagram.data[0] << 8) | datagram.data[1];
+            if (respId == queryId && !completer.isCompleted) {
+              completer.complete(_parseIps(datagram.data, qtype));
+            }
+          }
+        }
+      });
+      socket.send(packet, ip, targetPort);
+      Timer(timeout, () {
+        if (!completer.isCompleted) completer.complete(null);
+        try { socket.close(); } catch (_) {}
+      });
+      final result = await completer.future;
+      try { socket.close(); } catch (_) {}
+      if (result != null && result.isNotEmpty) return result;
+    } catch (_) {}
+    try {
+      final sock = await Socket.connect(ip, targetPort, timeout: timeout);
+      final framed = Uint8List(packet.length + 2);
+      framed[0] = (packet.length >> 8) & 0xFF;
+      framed[1] = packet.length & 0xFF;
+      framed.setRange(2, framed.length, packet);
+      sock.add(framed);
+      final chunks = <int>[];
+      await for (final data in sock.timeout(timeout, onTimeout: (s) { s.close(); })) {
+        chunks.addAll(data);
+        if (chunks.length >= 2) {
+          final len = (chunks[0] << 8) | chunks[1];
+          if (chunks.length >= 2 + len) {
+            await sock.close();
+            return _parseIps(Uint8List.fromList(chunks.sublist(2, 2 + len)), qtype);
+          }
+        }
+      }
+      await sock.close();
+    } catch (_) {}
+    return null;
+  }
+
+  List<String> _parseIps(List<int> msg, int wantType) {
+    if (msg.length < 12) return [];
+    final ancount = (msg[6] << 8) | msg[7];
+    var pos = 12;
+    void skipName() {
+      var jumps = 0;
+      while (pos < msg.length) {
+        final len = msg[pos];
+        if (len == 0) { pos++; return; }
+        if ((len & 0xC0) == 0xC0) { pos += 2; return; }
+        pos += 1 + len;
+        if (++jumps > 20) return;
+      }
+    }
+    skipName();
+    pos += 4;
+    final ips = <String>[];
+    for (var i = 0; i < ancount && pos + 10 <= msg.length; i++) {
+      skipName();
+      if (pos + 10 > msg.length) break;
+      final type = (msg[pos] << 8) | msg[pos + 1];
+      final rdlen = (msg[pos + 8] << 8) | msg[pos + 9];
+      pos += 10;
+      if (pos + rdlen > msg.length) break;
+      if (type == wantType) {
+        if (type == 1 && rdlen == 4) {
+          ips.add('${msg[pos]}.${msg[pos + 1]}.${msg[pos + 2]}.${msg[pos + 3]}');
+        } else if (type == 28 && rdlen == 16) {
+          final b = msg.sublist(pos, pos + 16);
+          final parts = <String>[];
+          for (var j = 0; j < 16; j += 2) {
+            parts.add(((b[j] << 8) | b[j + 1]).toRadixString(16));
+          }
+          ips.add(parts.join(':'));
+        }
+      }
+      pos += rdlen;
+    }
+    return ips;
   }
 }

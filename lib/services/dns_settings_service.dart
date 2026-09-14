@@ -8,8 +8,6 @@ class DnsSettingsService extends ChangeNotifier {
   static const String keyAutoReconnect = 'dns_auto_reconnect';
   static const String keyAutoConnectOnBoot = 'dns_auto_connect_boot';
   static const String keyQueryTimeout = 'dns_query_timeout';
-  static const String keyAppTheme = 'dns_app_theme';
-  static const String keyAppLanguage = 'dns_app_language';
   static const String keyDnsLeakProtection = 'dns_leak_protection';
   static const String keyFallbackSecondary = 'dns_fallback_secondary';
 
@@ -17,8 +15,6 @@ class DnsSettingsService extends ChangeNotifier {
   bool autoReconnect = true;
   bool autoConnectOnBoot = false;
   int queryTimeoutMs = 2500;
-  String appTheme = 'dark'; // dark, amoled, light, system
-  String appLanguage = 'fa'; // fa, en
   bool dnsLeakProtection = true;
   bool fallbackSecondary = true;
 
@@ -28,8 +24,6 @@ class DnsSettingsService extends ChangeNotifier {
     autoReconnect = prefs.getBool(keyAutoReconnect) ?? true;
     autoConnectOnBoot = prefs.getBool(keyAutoConnectOnBoot) ?? false;
     queryTimeoutMs = prefs.getInt(keyQueryTimeout) ?? 2500;
-    appTheme = prefs.getString(keyAppTheme) ?? 'dark';
-    appLanguage = prefs.getString(keyAppLanguage) ?? 'fa';
     dnsLeakProtection = prefs.getBool(keyDnsLeakProtection) ?? true;
     fallbackSecondary = prefs.getBool(keyFallbackSecondary) ?? true;
     notifyListeners();
@@ -40,8 +34,6 @@ class DnsSettingsService extends ChangeNotifier {
     bool? newAutoReconnect,
     bool? newAutoConnectOnBoot,
     int? newQueryTimeoutMs,
-    String? newAppTheme,
-    String? newAppLanguage,
     bool? newDnsLeakProtection,
     bool? newFallbackSecondary,
   }) async {
@@ -61,14 +53,6 @@ class DnsSettingsService extends ChangeNotifier {
     if (newQueryTimeoutMs != null) {
       queryTimeoutMs = newQueryTimeoutMs;
       await prefs.setInt(keyQueryTimeout, newQueryTimeoutMs);
-    }
-    if (newAppTheme != null) {
-      appTheme = newAppTheme;
-      await prefs.setString(keyAppTheme, newAppTheme);
-    }
-    if (newAppLanguage != null) {
-      appLanguage = newAppLanguage;
-      await prefs.setString(keyAppLanguage, newAppLanguage);
     }
     if (newDnsLeakProtection != null) {
       dnsLeakProtection = newDnsLeakProtection;

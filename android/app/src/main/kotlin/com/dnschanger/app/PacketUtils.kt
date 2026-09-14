@@ -180,9 +180,7 @@ object PacketUtils {
 
             val total = 40 + tcpLen
             val buf = ByteBuffer.allocate(total)
-            buf.put((0x60).toByte())
-            buf.put(0)
-            buf.put(0)
+            buf.putInt(0x60000000)
             buf.putShort(tcpLen.toShort())
             buf.put(PROTO_TCP.toByte())
             buf.put(64)
@@ -237,7 +235,7 @@ object PacketUtils {
         return (sum.toInt() and 0xFFFF).inv() and 0xFFFF
     }
 
-    private fun checksumConcat(first: ByteArray, second: ByteArray): Int {
+    fun checksumConcat(first: ByteArray, second: ByteArray): Int {
         var sum = 0L
         var i = 0
         while (i < first.size - 1) {

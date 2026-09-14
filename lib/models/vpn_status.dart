@@ -17,12 +17,14 @@ class VpnStatus {
     this.errorCode,
     this.notificationsEnabled = true,
     this.revision = -1,
+    this.connectedAt,
   });
 
   final VpnPhase phase;
   final String? errorCode;
   final bool notificationsEnabled;
   final int revision;
+  final int? connectedAt;
 
   bool get isConnected => phase == VpnPhase.connected;
   bool get isPaused => phase == VpnPhase.paused;
@@ -66,6 +68,7 @@ class VpnStatus {
       errorCode: phase.isEmpty ? 'unavailable' : data['errorCode'] as String?,
       notificationsEnabled: data['notificationsEnabled'] != false,
       revision: (data['revision'] as num?)?.toInt() ?? 0,
+      connectedAt: (data['connectedAt'] as num?)?.toInt(),
     );
   }
 }

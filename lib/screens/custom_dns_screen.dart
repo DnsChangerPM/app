@@ -130,11 +130,16 @@ class _CustomDnsScreenState extends State<CustomDnsScreen> {
             FilledButton(
               onPressed: () async {
                 try {
-                  final count = await _backupService.importAndSave(controller.text);
+                  final result = await _backupService.importAndSave(controller.text);
                   if (context.mounted) {
                     Navigator.pop(context, true);
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('$count سرور DNS با موفقیت اضافه شد.')),
+                      SnackBar(
+                        content: Text(
+                          '${result.imported} سرور وارد شد'
+                          '${result.skipped > 0 ? '، ${result.skipped} رد شد' : ''}.',
+                        ),
+                      ),
                     );
                   }
                 } catch (e) {

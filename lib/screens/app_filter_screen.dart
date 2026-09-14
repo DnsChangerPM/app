@@ -20,6 +20,7 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
   AppFilterMode _mode = AppFilterMode.all;
   bool _loading = true;
   bool _saving = false;
+  bool _appsFailed = false;
   String _searchQuery = '';
 
   @override
@@ -35,6 +36,7 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
     if (mounted) {
       setState(() {
         _allApps = apps;
+        _appsFailed = _filterService.lastAppsLoadFailed;
         _mode = _filterService.mode;
         _selectedPackages = Set.from(_filterService.selectedPackages);
         _loading = false;
@@ -51,10 +53,12 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
       newPackages: _selectedPackages,
     );
 
-    // If single app mode, sync target package
-    if (_mode == AppFilterMode.single && _selectedPackages.isNotEmpty) {
+    if (_mode == AppFilterMode.single) {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(TargetPackagePolicy.prefsKey, _selectedPackages.first);
+      final existing = prefs.getString(TargetPackagePolicy.prefsKey);
+      if (existing != null && existing.isNotEmpty) {
+        await prefs.setString(TargetPackagePolicy.prefsKey, existing);
+      }
     }
 
     if (mounted) {
@@ -76,12 +80,25 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
   }
 
   void _selectGames() {
-    final gamePatterns = ['pubg', 'tencent', 'activision', 'supercell', 'riot', 'ea', 'game', 'epic', 'garena'];
+    final vendorPrefixes = [
+      'com.tencent',
+      'com.activision',
+      'com.supercell',
+      'com.riotgames',
+      'com.ea',
+      'com.epicgames',
+      'com.garena',
+    ];
+    final nameRe = RegExp(
+      r'\b(games?|mobile legends|pubg|cod|free fire|clash|brawl)\b',
+      caseSensitive: false,
+    );
     final newSel = Set<String>.from(_selectedPackages);
     for (final app in _allApps) {
       final p = app.packageName.toLowerCase();
       final n = app.appName.toLowerCase();
-      if (gamePatterns.any((g) => p.contains(g) || n.contains(g))) {
+      final vendor = vendorPrefixes.any((v) => p == v || p.startsWith('$v.'));
+      if (vendor || nameRe.hasMatch(n) || nameRe.hasMatch(p.replaceAll('.', ' '))) {
         newSel.add(app.packageName);
       }
     }
@@ -145,6 +162,18 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
                           activeColor: const Color(0xFF00D1B2),
                         ),
                         RadioListTile<AppFilterMode>(
+                          value: AppFilterMode.single,
+                          groupValue: _mode,
+                          onChanged: (v) => setState(() => _mode = v!),
+                          title: const Text('تک‌برنامه (از تنظیمات)'),
+                          subtitle: const Text(
+                            'فقط برنامهٔ هدف ذخیره‌شده در تنظیمات (مثلاً بازی) از DNS استفاده می‌کند.',
+                            style: TextStyle(fontSize: 12, color: Colors.white60),
+                          ),
+                          contentPadding: EdgeInsets.zero,
+                          activeColor: const Color(0xFF00D1B2),
+                        ),
+                        RadioListTile<AppFilterMode>(
                           value: AppFilterMode.allowed,
                           groupValue: _mode,
                           onChanged: (v) => setState(() => _mode = v!),
@@ -173,7 +202,7 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
                   ),
 
                   // Quick action buttons
-                  if (_mode != AppFilterMode.all) ...[
+                  if (_mode != AppFilterMode.all && _mode != AppFilterMode.single) ...[
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                       child: SingleChildScrollView(
@@ -235,7 +264,7 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
                   ],
 
                   // Apps list
-                  if (_mode != AppFilterMode.all)
+                  if (_mode != AppFilterMode.all && _mode != AppFilterMode.single)
                     Expanded(
                       child: ListView.builder(
                         itemCount: _filteredApps.length,

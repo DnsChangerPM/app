@@ -20,7 +20,11 @@ data class VpnConfig(
     val upstreams: List<Pair<String, Int>>,
     val allowedPackages: List<String> = emptyList(),
     val disallowedPackages: List<String> = emptyList(),
-    val enableIpv6: Boolean = true
+    val enableIpv6: Boolean = true,
+    val autoReconnect: Boolean = true,
+    val timeoutMs: Int = 2500,
+    val fallbackSecondary: Boolean = true,
+    val dnsLeakProtection: Boolean = true
 ) {
     val encodedAddresses: List<String>
         get() = upstreams.map { (host, port) ->
@@ -33,14 +37,22 @@ data class VpnConfig(
             port: Int,
             packages: List<String> = emptyList(),
             disallowed: List<String> = emptyList(),
-            enableIpv6: Boolean = true
+            enableIpv6: Boolean = true,
+            autoReconnect: Boolean = true,
+            timeoutMs: Int = 2500,
+            fallbackSecondary: Boolean = true,
+            dnsLeakProtection: Boolean = true
         ): VpnConfig {
             if (port !in 1..65535 || addresses.isEmpty()) throw VpnFailure("invalid_dns")
             val upstreams = addresses.map { parseAddress(it, port) }.distinct()
             val allowed = packages.map { it.trim() }.distinct()
             if (allowed.any { it.isEmpty() }) throw VpnFailure("invalid_target")
             val disallowList = disallowed.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-            return VpnConfig(upstreams, allowed, disallowList, enableIpv6)
+            val timeout = timeoutMs.coerceIn(500, 10_000)
+            return VpnConfig(
+                upstreams, allowed, disallowList, enableIpv6,
+                autoReconnect, timeout, fallbackSecondary, dnsLeakProtection
+            )
         }
 
         private fun parseAddress(address: String, defaultPort: Int): Pair<String, Int> {

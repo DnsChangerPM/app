@@ -29,6 +29,9 @@ class VpnServiceController {
     List<String> disallowedPackages = const [],
     bool enableIpv6 = true,
     int timeoutMs = 2500,
+    bool autoReconnect = true,
+    bool fallbackSecondary = true,
+    bool dnsLeakProtection = true,
   }) {
     return _command('start', {
       'addresses': addresses,
@@ -37,8 +40,14 @@ class VpnServiceController {
       'disallowedPackages': disallowedPackages,
       'enableIpv6': enableIpv6,
       'timeoutMs': timeoutMs,
+      'autoReconnect': autoReconnect,
+      'fallbackSecondary': fallbackSecondary,
+      'dnsLeakProtection': dnsLeakProtection,
     });
   }
+
+  Future<void> setQueryLogging(bool enabled) =>
+      _command('setQueryLogging', {'enabled': enabled});
 
   Future<void> pause() => _command('pause');
   Future<void> resume() => _command('resume');

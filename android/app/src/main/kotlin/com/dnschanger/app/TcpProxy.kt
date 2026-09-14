@@ -25,7 +25,9 @@ class TcpProxy(
     private val upstreams: List<Pair<String, Int>>,
     private val protectSocket: (Socket) -> Boolean,
     private val write: (ByteArray) -> Unit,
-    private val onClose: (TcpProxy) -> Unit
+    private val onClose: (TcpProxy) -> Unit,
+    private val fallbackSecondary: Boolean = true,
+    private val onQuery: ((ByteArray, Int, Long) -> Unit)? = null
 ) {
     companion object {
         private const val TAG = "TcpProxy"
@@ -34,18 +36,19 @@ class TcpProxy(
         const val RST = 0x04
         const val PSH = 0x08
         const val ACK = 0x10
+        private const val MAX_SEGMENT = 1440
     }
 
     private enum class State { NEW, SYN_RECEIVED, ESTABLISHED, CLOSED }
 
-    private var state = State.NEW
-    private var clientNextSeq = 0
-    private var serverSeq = Random.nextInt(0, Int.MAX_VALUE)
+    @Volatile private var state = State.NEW
+    @Volatile private var clientNextSeq = 0
+    @Volatile private var serverSeq = Random.nextInt(0, Int.MAX_VALUE)
     private val reassembly = ByteArrayOutputStream()
 
     private val socketLock = Any()
     private var socket: Socket? = null
-    private var upstreamOut: OutputStream? = null
+    @Volatile private var upstreamOut: OutputStream? = null
     private var upstreamThread: Thread? = null
     private val lastActive = AtomicLong(0)
     private val closed = AtomicBoolean(false)
@@ -65,13 +68,13 @@ class TcpProxy(
         try { closing?.close() } catch (_: Exception) { }
     }
 
+    @Synchronized
     fun feed(segment: ByteArray, offset: Int, length: Int, flags: Int) {
         if (closed.get()) return
         lastActive.set(System.currentTimeMillis())
         if (length < offset + 20) return
 
         val seq = readInt(segment, offset + 4)
-        val ack = readInt(segment, offset + 8)
         val dataOffset = ((segment[offset + 12].toInt() shr 4) and 0xF) * 4
         val payloadStart = offset + dataOffset
         val payloadLen = if (length > payloadStart) length - payloadStart else 0
@@ -84,22 +87,23 @@ class TcpProxy(
             (flags and SYN) != 0 && state == State.NEW -> {
                 clientNextSeq = seq + 1
                 serverSeq = Random.nextInt(0, Int.MAX_VALUE)
-                sendSegment(SYN or ACK, serverSeq, clientNextSeq, ByteArray(0))
-                serverSeq += 1
+                val synAckSeq = serverSeq
+                sendSegment(SYN or ACK, synAckSeq, clientNextSeq, ByteArray(0))
+                serverSeq = synAckSeq + 1
                 state = State.SYN_RECEIVED
             }
             state == State.SYN_RECEIVED && (flags and ACK) != 0 -> {
-                if (ack == serverSeq) {
+                if (readInt(segment, offset + 8) == serverSeq) {
                     state = State.ESTABLISHED
                     connectUpstream()
                     if (payloadLen > 0) {
-                        acceptData(segment, payloadStart, payloadLen, seq, flags)
+                        acceptData(segment, payloadStart, payloadLen, seq)
                     }
                 }
             }
             state == State.ESTABLISHED -> {
                 if (payloadLen > 0) {
-                    acceptData(segment, payloadStart, payloadLen, seq, flags)
+                    acceptData(segment, payloadStart, payloadLen, seq)
                 }
                 if ((flags and FIN) != 0) {
                     clientNextSeq += 1
@@ -112,15 +116,13 @@ class TcpProxy(
         }
     }
 
-    private fun acceptData(segment: ByteArray, payloadStart: Int, payloadLen: Int, seq: Int, flags: Int) {
+    private fun acceptData(segment: ByteArray, payloadStart: Int, payloadLen: Int, seq: Int) {
         if (seq == clientNextSeq) {
             clientNextSeq += payloadLen
             val payload = segment.copyOfRange(payloadStart, payloadStart + payloadLen)
             handleData(payload)
-            // Acknowledge received data.
             sendSegment(ACK, serverSeq, clientNextSeq, ByteArray(0))
         } else {
-            // Out-of-order or retransmission: re-ack our position.
             sendSegment(ACK, serverSeq, clientNextSeq, ByteArray(0))
         }
     }
@@ -158,66 +160,90 @@ class TcpProxy(
     }
 
     private fun connectUpstream() {
-        val upstream = upstreams.firstOrNull() ?: return
         upstreamThread = Thread(upstream@{
-            try {
-                val s = Socket()
-                synchronized(socketLock) {
-                    if (closed.get()) { s.close(); return@upstream }
-                    // Save it before connect() so pause/disconnect can cancel a
-                    // pending TCP connection, not leave it alive for 10 seconds.
-                    socket = s
-                }
-                if (!protectSocket(s)) throw IOException("DNS socket protection failed")
-                s.connect(InetSocketAddress(upstream.first, upstream.second), 10_000)
+            val candidates = if (fallbackSecondary) upstreams else upstreams.take(1)
+            var answered = false
+            for ((index, upstream) in candidates.withIndex()) {
                 if (closed.get()) return@upstream
-                upstreamOut = BufferedOutputStream(s.getOutputStream())
-                // Forward anything the client sent while we were connecting.
-                val pending = synchronized(this) {
-                    val b = reassembly.toByteArray()
-                    reassembly.reset()
-                    b
-                }
-                if (pending.isNotEmpty()) {
-                    handleData(pending)
-                }
-                val input: InputStream = BufferedInputStream(s.getInputStream())
-                val lenBuf = ByteArray(2)
-                while (!closed.get()) {
-                    var headerRead = 0
-                    while (headerRead < 2) {
-                        val count = input.read(lenBuf, headerRead, 2 - headerRead)
-                        if (count < 0) break
-                        headerRead += count
+                try {
+                    val s = Socket()
+                    synchronized(socketLock) {
+                        if (closed.get()) { s.close(); return@upstream }
+                        socket = s
                     }
-                    if (headerRead != 2) break
-                    val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-                    val response = ByteArray(respLen)
-                    var read = 0
-                    while (read < respLen) {
-                        val n = input.read(response, read, respLen - read)
-                        if (n < 0) break
-                        read += n
+                    if (!protectSocket(s)) throw IOException("DNS socket protection failed")
+                    s.connect(InetSocketAddress(upstream.first, upstream.second), 10_000)
+                    if (closed.get()) return@upstream
+                    synchronized(this) {
+                        upstreamOut = BufferedOutputStream(s.getOutputStream())
                     }
-                    if (read < respLen) break
-                    sendDnsResponse(response)
+                    val pending = synchronized(this) {
+                        val b = reassembly.toByteArray()
+                        reassembly.reset()
+                        b
+                    }
+                    if (pending.isNotEmpty()) {
+                        handleData(pending)
+                    }
+                    val input: InputStream = BufferedInputStream(s.getInputStream())
+                    val lenBuf = ByteArray(2)
+                    val started = System.currentTimeMillis()
+                    while (!closed.get()) {
+                        var headerRead = 0
+                        while (headerRead < 2) {
+                            val count = input.read(lenBuf, headerRead, 2 - headerRead)
+                            if (count < 0) break
+                            headerRead += count
+                        }
+                        if (headerRead != 2) break
+                        val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+                        val response = ByteArray(respLen)
+                        var read = 0
+                        while (read < respLen) {
+                            val n = input.read(response, read, respLen - read)
+                            if (n < 0) break
+                            read += n
+                        }
+                        if (read < respLen) break
+                        answered = true
+                        sendDnsResponse(response)
+                        onQuery?.invoke(response, index, System.currentTimeMillis() - started)
+                    }
+                    if (answered) break
+                } catch (e: Exception) {
+                    if (!closed.get()) Log.w(TAG, "upstream DNS connection failed")
+                } finally {
+                    synchronized(this) { upstreamOut = null }
+                    val closing = synchronized(socketLock) {
+                        val current = socket
+                        socket = null
+                        current
+                    }
+                    try { closing?.close() } catch (_: Exception) {}
                 }
-            } catch (e: Exception) {
-                if (!closed.get()) Log.w(TAG, "upstream DNS connection failed")
-            } finally {
-                if (!closed.get()) onClose(this)
+                if (answered) break
             }
+            if (!closed.get()) onClose(this)
         }, "TcpProxy-upstream")
         upstreamThread!!.start()
     }
 
+    @Synchronized
     private fun sendDnsResponse(response: ByteArray) {
         val framed = ByteArray(response.size + 2)
         framed[0] = ((response.size shr 8) and 0xFF).toByte()
         framed[1] = (response.size and 0xFF).toByte()
         System.arraycopy(response, 0, framed, 2, response.size)
-        sendSegment(PSH or ACK, serverSeq, clientNextSeq, framed)
-        serverSeq += framed.size
+        var offset = 0
+        while (offset < framed.size) {
+            val end = minOf(offset + MAX_SEGMENT, framed.size)
+            val slice = framed.copyOfRange(offset, end)
+            val flags = if (end == framed.size) PSH or ACK else ACK
+            val seq = serverSeq
+            sendSegment(flags, seq, clientNextSeq, slice)
+            serverSeq = seq + slice.size
+            offset = end
+        }
     }
 
     private fun sendSegment(flags: Int, seq: Int, ack: Int, payload: ByteArray) {

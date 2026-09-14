@@ -1,6 +1,8 @@
 import 'package:dns_changer/models/app_info.dart';
+import 'package:dns_changer/screens/app_filter_screen.dart';
 import 'package:dns_changer/services/app_filter_service.dart';
 import 'package:dns_changer/services/target_package_policy.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -57,4 +59,33 @@ void main() {
     expect(resolved.allowed, isEmpty);
     expect(resolved.disallowed, containsAll(['com.bank.app', 'com.bypass.app']));
   });
+
+  test('save allowed mode does not set focus_game', () async {
+    final service = AppFilterService();
+    await service.save(newMode: AppFilterMode.allowed, newPackages: {'com.a'});
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('focus_game'), isFalse);
+    expect(prefs.getString('app_filter_mode'), 'allowed');
+  });
+
+  test('save single mode sets focus_game', () async {
+    final service = AppFilterService();
+    await service.save(newMode: AppFilterMode.single);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('focus_game'), isTrue);
+  });
+
+  testWidgets('single mode radio is visible', (tester) async {
+    AppFilterService.debugInstalledApps = const [
+      AppInfo(packageName: 'com.tencent.ig', appName: 'PUBG'),
+    ];
+    addTearDown(() => AppFilterService.debugInstalledApps = null);
+    SharedPreferences.setMockInitialValues({'app_filter_mode': 'single'});
+    await tester.pumpWidget(const MaterialApp(home: AppFilterScreen()));
+    await tester.pumpAndSettle();
+    expect(find.text('تک‌برنامه (از تنظیمات)'), findsOneWidget);
+  });
 }
+
+void filterScreenVisibility() {}
+

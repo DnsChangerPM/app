@@ -12,8 +12,10 @@ class MainActivity : FlutterActivity() {
     private var vpnChannel: MethodChannel? = null
     private var updateChannel: MethodChannel? = null
     private var statusChannel: EventChannel? = null
+    private var queryChannel: EventChannel? = null
     private var statusSink: EventChannel.EventSink? = null
     private var statusListener: ((VpnSnapshot) -> Unit)? = null
+    private var queryListener: ((Map<String, Any?>) -> Unit)? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -38,6 +40,23 @@ class MainActivity : FlutterActivity() {
                 }
 
                 override fun onCancel(arguments: Any?) = removeStatusListener()
+            })
+        }
+        queryChannel = EventChannel(messenger, DnsQueryEvents.CHANNEL).also {
+            it.setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    queryListener?.let { DnsQueryEvents.removeListener(it) }
+                    val listener: (Map<String, Any?>) -> Unit = { event ->
+                        runOnUiThread { events.success(event) }
+                    }
+                    queryListener = listener
+                    DnsQueryEvents.addListener(listener)
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    queryListener?.let { DnsQueryEvents.removeListener(it) }
+                    queryListener = null
+                }
             })
         }
     }

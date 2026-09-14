@@ -7,12 +7,15 @@ import java.nio.channels.DatagramChannel
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentLinkedQueue
 
 class DnsResolver(
     private val upstreams: List<Pair<String, Int>>,
     protectSocket: (DatagramSocket) -> Boolean,
-    private val onResponse: (PendingQuery, ByteArray) -> Unit
+    private val onResponse: (PendingQuery, ByteArray) -> Unit,
+    timeoutMs: Int = 2500,
+    private val fallbackSecondary: Boolean = true,
+    private val onQuery: ((PendingQuery, ByteArray, Int) -> Unit)? = null
 ) : Runnable {
 
     data class PendingQuery(
@@ -21,16 +24,25 @@ class DnsResolver(
         val srcPort: Int,
         val dstAddr: ByteArray,
         val timestamp: Long,
-        var secondarySent: Boolean = false
-    )
+        val query: ByteArray,
+        var upstreamIndex: Int = 0,
+        var lastSentAt: Long = timestamp
+    ) {
+        fun key(): String = "$id|${srcPort}|${srcAddr.contentHashCode()}"
+    }
+
+    private val perUpstreamTimeout = timeoutMs.coerceIn(500, 10_000).toLong()
+    private val totalBudget = (perUpstreamTimeout * (if (fallbackSecondary) maxOf(upstreams.size, 1) else 1) + 2000)
+        .coerceAtMost(10_000L)
+        .coerceAtLeast(perUpstreamTimeout)
 
     private val channel: DatagramChannel = DatagramChannel.open().apply { configureBlocking(false) }
     private val selector: Selector = try { Selector.open() } catch (error: Exception) {
         channel.close()
         throw error
     }
-    private val pending = ConcurrentHashMap<Int, PendingQuery>()
-    private val idx = AtomicInteger(0)
+    private val pending = ConcurrentHashMap<String, PendingQuery>()
+    private val byId = ConcurrentHashMap<Int, ConcurrentLinkedQueue<String>>()
 
     @Volatile
     private var running = true
@@ -55,40 +67,58 @@ class DnsResolver(
     fun stop() {
         running = false
         pending.clear()
+        byId.clear()
         thread.interrupt()
-        try {
-            selector.wakeup()
-        } catch (_: Exception) {
-        }
-        try {
-            channel.close()
-        } catch (_: Exception) {
-        }
-        try {
-            selector.close()
-        } catch (_: Exception) {
-        }
+        try { selector.wakeup() } catch (_: Exception) {}
+        try { channel.close() } catch (_: Exception) {}
+        try { selector.close() } catch (_: Exception) {}
     }
 
     fun resolve(query: ByteArray, srcAddr: ByteArray, srcPort: Int, dstAddr: ByteArray) {
-        if (!running || query.size < 2 || upstreams.isEmpty()) return
-        val id = ((query[0].toInt() and 0xFF) shl 8) or (query[1].toInt() and 0xFF)
-        val upstream = upstreams[0] // Prefer primary upstream first for speed
-        pending[id] = PendingQuery(id, srcAddr, srcPort, dstAddr, System.currentTimeMillis())
+        resolve(query, 0, query.size, srcAddr, srcPort, dstAddr)
+    }
+
+    fun resolve(query: ByteArray, offset: Int, length: Int, srcAddr: ByteArray, srcPort: Int, dstAddr: ByteArray) {
+        if (!running || length < 2 || upstreams.isEmpty() || offset < 0 || offset + length > query.size) return
+        val id = ((query[offset].toInt() and 0xFF) shl 8) or (query[offset + 1].toInt() and 0xFF)
+        val copy = query.copyOfRange(offset, offset + length)
+        val now = System.currentTimeMillis()
+        val p = PendingQuery(id, srcAddr, srcPort, dstAddr, now, copy)
+        pending[p.key()] = p
+        byId.getOrPut(id) { ConcurrentLinkedQueue() }.add(p.key())
+        sendTo(p, 0)
+    }
+
+    private fun sendTo(p: PendingQuery, index: Int) {
+        if (index !in upstreams.indices) return
+        p.upstreamIndex = index
+        p.lastSentAt = System.currentTimeMillis()
         try {
-            channel.send(ByteBuffer.wrap(query), InetSocketAddress(upstream.first, upstream.second))
-        } catch (e: Exception) {
-            if (upstreams.size > 1) {
-                try {
-                    val sec = upstreams[1]
-                    channel.send(ByteBuffer.wrap(query), InetSocketAddress(sec.first, sec.second))
-                } catch (_: Exception) {
-                    pending.remove(id)
-                }
+            val up = upstreams[index]
+            channel.send(ByteBuffer.wrap(p.query), InetSocketAddress(up.first, up.second))
+        } catch (_: Exception) {
+            if (fallbackSecondary && index + 1 < upstreams.size) {
+                sendTo(p, index + 1)
             } else {
-                pending.remove(id)
+                removePending(p)
             }
         }
+    }
+
+    private fun removePending(p: PendingQuery) {
+        pending.remove(p.key())
+        byId[p.id]?.remove(p.key())
+    }
+
+    private fun takePending(id: Int): PendingQuery? {
+        val queue = byId[id] ?: return null
+        var key = queue.poll()
+        while (key != null) {
+            val p = pending.remove(key)
+            if (p != null) return p
+            key = queue.poll()
+        }
+        return null
     }
 
     override fun run() {
@@ -109,25 +139,33 @@ class DnsResolver(
                             val response = ByteArray(buf.remaining())
                             buf.get(response)
                             val id = ((response[0].toInt() and 0xFF) shl 8) or (response[1].toInt() and 0xFF)
-                            val p = pending.remove(id) ?: continue
+                            val p = takePending(id) ?: continue
                             try {
                                 onResponse(p, response)
+                                onQuery?.invoke(p, response, p.upstreamIndex)
                             } catch (_: Exception) {
                             }
                         }
                     }
                 }
-                // Cleanup stale queries older than 10 seconds
                 val now = System.currentTimeMillis()
                 val it = pending.entries.iterator()
                 while (it.hasNext()) {
                     val entry = it.next()
-                    if (now - entry.value.timestamp > 10_000) {
+                    val p = entry.value
+                    if (now - p.timestamp > totalBudget) {
                         it.remove()
+                        byId[p.id]?.remove(p.key())
+                        continue
+                    }
+                    if (fallbackSecondary &&
+                        p.upstreamIndex + 1 < upstreams.size &&
+                        now - p.lastSentAt >= perUpstreamTimeout
+                    ) {
+                        sendTo(p, p.upstreamIndex + 1)
                     }
                 }
             } catch (_: Exception) {
-                // keep looping
             }
         }
     }
