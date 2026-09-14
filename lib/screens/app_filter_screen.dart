@@ -201,6 +201,26 @@ class _AppFilterScreenState extends State<AppFilterScreen> {
                     ),
                   ),
 
+                  // Load failure notice
+                  if (_appsFailed)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      color: const Color(0x33F59E0B),
+                      child: const Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded, size: 18, color: Color(0xFFF59E0B)),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'دریافت فهرست برنامه‌های نصب‌شده ناموفق بود؛ فهرست پیشنهادی نمایش داده می‌شود.',
+                              style: TextStyle(fontSize: 12, color: Colors.white70),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
                   // Quick action buttons
                   if (_mode != AppFilterMode.all && _mode != AppFilterMode.single) ...[
                     Padding(

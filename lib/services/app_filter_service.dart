@@ -13,6 +13,14 @@ class AppFilterService {
   AppFilterMode mode = AppFilterMode.all;
   Set<String> selectedPackages = {};
 
+  /// Whether the last [getInstalledApps] call failed to fetch the installed
+  /// apps from the platform. When true, the returned list is a fallback.
+  bool lastAppsLoadFailed = false;
+
+  /// Test hook: when set, [getInstalledApps] returns this list instead of
+  /// calling the platform channel.
+  static List<AppInfo>? debugInstalledApps;
+
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     final modeStr = prefs.getString(keyFilterMode);
@@ -52,6 +60,14 @@ class AppFilterService {
   }
 
   Future<List<AppInfo>> getInstalledApps() async {
+    lastAppsLoadFailed = false;
+
+    final debugApps = debugInstalledApps;
+    if (debugApps != null) {
+      return List<AppInfo>.from(debugApps)
+        ..sort((a, b) => a.appName.toLowerCase().compareTo(b.appName.toLowerCase()));
+    }
+
     try {
       final result = await _channel.invokeListMethod<Map<dynamic, dynamic>>('getInstalledApps');
       if (result != null && result.isNotEmpty) {
@@ -59,6 +75,8 @@ class AppFilterService {
           ..sort((a, b) => a.appName.toLowerCase().compareTo(b.appName.toLowerCase()));
       }
     } catch (_) {}
+
+    lastAppsLoadFailed = true;
 
     // Fallback list of common apps for simulator / testing
     return const [
