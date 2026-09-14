@@ -193,10 +193,8 @@ object PacketUtils {
     private fun buildUdp6(src: ByteArray, dst: ByteArray, srcPort: Int, dstPort: Int, payload: ByteArray): ByteArray {
         val total = 40 + 8 + payload.size
         val buf = ByteBuffer.allocate(total)
-        // IPv6 header
-        buf.put((0x60).toByte()) // version 6
-        buf.put(0)
-        buf.put(0)
+        // IPv6 version, traffic class and flow label occupy four bytes.
+        buf.putInt(0x60000000)
         buf.putShort((8 + payload.size).toShort()) // payload length
         buf.put(PROTO_UDP.toByte())
         buf.put(64) // hop limit
