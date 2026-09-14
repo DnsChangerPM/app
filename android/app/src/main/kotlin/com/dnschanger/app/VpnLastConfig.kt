@@ -73,12 +73,50 @@ object VpnLastConfig {
         val marker = "\"$key\":"
         val start = json.indexOf(marker)
         if (start < 0) return emptyList()
-        val open = json.indexOf('[', start)
-        val close = json.indexOf(']', open)
-        if (open < 0 || close < 0) return emptyList()
-        val body = json.substring(open + 1, close).trim()
-        if (body.isEmpty()) return emptyList()
-        return body.split(',').map { it.trim().trim('"') }.filter { it.isNotEmpty() }
+
+        var cursor = start + marker.length
+        while (cursor < json.length && json[cursor].isWhitespace()) cursor++
+        if (cursor >= json.length || json[cursor] != '[') throw IllegalArgumentException("Invalid list")
+        cursor++
+
+        val values = ArrayList<String>()
+        while (true) {
+            while (cursor < json.length && json[cursor].isWhitespace()) cursor++
+            if (cursor >= json.length) throw IllegalArgumentException("Unterminated list")
+            if (json[cursor] == ']') return values
+            if (json[cursor] != '"') throw IllegalArgumentException("Invalid string")
+            cursor++
+
+            val value = StringBuilder()
+            var closed = false
+            while (cursor < json.length) {
+                val ch = json[cursor++]
+                when (ch) {
+                    '"' -> {
+                        closed = true
+                        break
+                    }
+                    '\\' -> {
+                        if (cursor >= json.length) throw IllegalArgumentException("Invalid escape")
+                        when (val escaped = json[cursor++]) {
+                            '\\', '"' -> value.append(escaped)
+                            else -> throw IllegalArgumentException("Unsupported escape")
+                        }
+                    }
+                    else -> value.append(ch)
+                }
+            }
+            if (!closed) throw IllegalArgumentException("Unterminated string")
+            values.add(value.toString())
+
+            while (cursor < json.length && json[cursor].isWhitespace()) cursor++
+            if (cursor >= json.length) throw IllegalArgumentException("Unterminated list")
+            when (json[cursor++]) {
+                ',' -> continue
+                ']' -> return values
+                else -> throw IllegalArgumentException("Invalid list separator")
+            }
+        }
     }
 
     private fun parseBool(json: String, key: String, default: Boolean): Boolean {

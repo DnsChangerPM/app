@@ -19,6 +19,88 @@ object PacketUtils {
         val tcpFlags: Int
     )
 
+    data class DnsQuestion(val name: String, val qtype: Int)
+
+    /**
+     * Reads the first question from a DNS message.
+     *
+     * DNS names may contain compression pointers, including pointers to a later
+     * position in the packet. Every offset and pointer is checked so malformed
+     * traffic cannot crash the VPN packet-processing thread.
+     */
+    fun parseQuestion(message: ByteArray): DnsQuestion? {
+        if (message.size < DNS_HEADER_SIZE || readUnsignedShort(message, 4) < 1) return null
+
+        val labels = ArrayList<String>()
+        val visitedOffsets = HashSet<Int>()
+        var cursor = DNS_HEADER_SIZE
+        var questionEnd = -1
+        var expandedLength = 0
+
+        while (true) {
+            if (cursor !in message.indices || !visitedOffsets.add(cursor)) return null
+            val length = message[cursor].toInt() and 0xFF
+
+            when {
+                length and 0xC0 == 0xC0 -> {
+                    if (cursor + 1 >= message.size) return null
+                    val pointer = ((length and 0x3F) shl 8) or
+                        (message[cursor + 1].toInt() and 0xFF)
+                    if (pointer >= message.size) return null
+                    if (questionEnd < 0) questionEnd = cursor + 2
+                    cursor = pointer
+                }
+                length and 0xC0 != 0 -> return null // Reserved label encodings.
+                length == 0 -> {
+                    if (questionEnd < 0) questionEnd = cursor + 1
+                    break
+                }
+                else -> {
+                    val labelStart = cursor + 1
+                    val labelEnd = labelStart + length
+                    if (length > MAX_DNS_LABEL_LENGTH || labelEnd > message.size) return null
+                    expandedLength += length + if (labels.isEmpty()) 0 else 1
+                    if (expandedLength > MAX_DNS_NAME_LENGTH) return null
+                    labels.add(String(message, labelStart, length, Charsets.US_ASCII))
+                    cursor = labelEnd
+                }
+            }
+        }
+
+        if (labels.isEmpty() || questionEnd < 0 || questionEnd + 4 > message.size) return null
+        return DnsQuestion(labels.joinToString("."), readUnsignedShort(message, questionEnd))
+    }
+
+    fun qtypeName(qtype: Int): String = when (qtype) {
+        1 -> "A"
+        2 -> "NS"
+        5 -> "CNAME"
+        6 -> "SOA"
+        12 -> "PTR"
+        15 -> "MX"
+        16 -> "TXT"
+        28 -> "AAAA"
+        33 -> "SRV"
+        35 -> "NAPTR"
+        41 -> "OPT"
+        43 -> "DS"
+        46 -> "RRSIG"
+        47 -> "NSEC"
+        48 -> "DNSKEY"
+        52 -> "TLSA"
+        64 -> "SVCB"
+        65 -> "HTTPS"
+        255 -> "ANY"
+        else -> "TYPE$qtype"
+    }
+
+    private fun readUnsignedShort(data: ByteArray, offset: Int): Int =
+        ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
+
+    private const val DNS_HEADER_SIZE = 12
+    private const val MAX_DNS_LABEL_LENGTH = 63
+    private const val MAX_DNS_NAME_LENGTH = 253
+
     fun parse(packet: ByteArray, length: Int): Parsed? {
         if (length < 20) return null
         val version = (packet[0].toInt() shr 4) and 0xF
@@ -111,10 +193,8 @@ object PacketUtils {
     private fun buildUdp6(src: ByteArray, dst: ByteArray, srcPort: Int, dstPort: Int, payload: ByteArray): ByteArray {
         val total = 40 + 8 + payload.size
         val buf = ByteBuffer.allocate(total)
-        // IPv6 header
-        buf.put((0x60).toByte()) // version 6
-        buf.put(0)
-        buf.put(0)
+        // IPv6 version, traffic class and flow label occupy four bytes.
+        buf.putInt(0x60000000)
         buf.putShort((8 + payload.size).toShort()) // payload length
         buf.put(PROTO_UDP.toByte())
         buf.put(64) // hop limit

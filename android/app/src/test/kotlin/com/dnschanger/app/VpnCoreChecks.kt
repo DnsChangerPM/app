@@ -215,9 +215,13 @@ object VpnCoreChecks {
             val server = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 3000 }
             val answered = CountDownLatch(1)
             var protectedSocket: DatagramSocket? = null
-            val resolver = DnsResolver(listOf("127.0.0.1" to server.localPort), { socket -> protectedSocket = socket; true }) { pending, data ->
-                if (pending.id == 0x1234 && data.size == 12) answered.countDown()
-            }
+            val resolver = DnsResolver(
+                listOf("127.0.0.1" to server.localPort),
+                { socket -> protectedSocket = socket; true },
+                onResponse = { pending, data ->
+                    if (pending.id == 0x1234 && data.size == 12) answered.countDown()
+                }
+            )
             val echo = Thread {
                 try {
                     val packet = DatagramPacket(ByteArray(512), 512)
@@ -242,7 +246,11 @@ object VpnCoreChecks {
         "failed socket protection closes resources instead of creating a DNS loop" to {
             var socket: DatagramSocket? = null
             failure("socket_protection_failed") {
-                DnsResolver(listOf("127.0.0.1" to 53), { current -> socket = current; false }) { _, _ -> }
+                DnsResolver(
+                    listOf("127.0.0.1" to 53),
+                    { current -> socket = current; false },
+                    onResponse = { _, _ -> }
+                )
             }
             check(socket?.isClosed == true)
         },
@@ -317,6 +325,17 @@ object VpnCoreChecks {
                 3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0
             )
             check(PacketUtils.parseQuestion(withPtr)?.name == "google.com")
+            check(PacketUtils.qtypeName(1) == "A")
+            check(PacketUtils.qtypeName(28) == "AAAA")
+            check(PacketUtils.qtypeName(65) == "HTTPS")
+            check(PacketUtils.qtypeName(65400) == "TYPE65400")
+
+            val pointerLoop = byteArrayOf(
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xC0.toByte(), 12, 0, 1, 0, 1
+            )
+            check(PacketUtils.parseQuestion(pointerLoop) == null)
+            check(PacketUtils.parseQuestion(a.copyOf(a.size - 1)) == null)
         },
         "UDP failover sends to the second upstream after timeout" to {
             val silent = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 50 }
